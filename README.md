@@ -5,6 +5,20 @@ A local, private actor-replacement studio that runs entirely in the browser. Imp
 No server, no account, no paid API. All media stays in the browser's IndexedDB on your device.
 
 
+## What's new in v0.2
+- **Full-Body Animate** (new mode, experimental). Inspired by Wan Animate's character replacement, but running on your phone: the full-body photo in your character profile is cut out, meshed and rigged to 10 bones from your own pose, then driven every frame by the actor's tracked shoulders, elbows, wrists, hips, knees and ankles (linear blend skinning in WebGL). Your face replacement and hair sit on top.
+  - **Keep the original scene:** a *clean plate* (built from frames where the background was visible, or uploaded) paints out the original actor before your body is drawn. Building works for tripod shots.
+  - **New background:** solid colour or your own image.
+  - It is 2D warping of one photo: turning around, crossed limbs, fingers and loose clothing are not simulated. Real Wan 2.2 Animate needs an ~80 GB-class data-center GPU, which no phone has.
+- **Dub Studio** (new step between Editor and Render). Your voice replaces the actor's lines:
+  - Find lines with **Whisper** (Transformers.js, on-device after a one-time ~40–80 MB download) or with voice-activity detection (no download), or add them by hand.
+  - **Teleprompter recording** per line: listen to the original, 3-beep countdown, record while a bar fills.
+  - Each take is silence-trimmed, **time-fitted with WSOLA** (pitch preserved, 0.7–1.4× limit with a warning) and level-matched so it lands where the actor's mouth moves.
+  - Original voice inside dubbed lines: lower it, mute it, or remove the centre-panned voice (stereo).
+  - Room reverb, tone matching, preview with picture, WAV export, and the render uses the dub as the soundtrack.
+  - **Voice cloning:** in-app cloning TTS is not built in yet. Browser engines exist (Kyutai Pocket TTS ports, Chatterbox via Transformers.js), but none is verified on iPhone Safari. You can generate a line in a local cloning tool and **Import audio** for that line; it is fitted the same way. Only use voices of people who agreed.
+- Mipmapped textures now honour transparency (needed for the body cutout).
+
 ## What's new in v0.1.1
 - **Photos and posters.** Import a JPEG/PNG/HEIC instead of a video. RECAST detects the actors, replaces the face (and optionally hair/outfit) at full resolution up to 3072px, and exports a PNG or JPEG poster. Same editor tools: compare, keyframes, restore brush, verify.
 - **Hair & outfit checkboxes.** When creating a project (and per actor in Cast Director and the editor):
@@ -154,7 +168,7 @@ Status below is what the code does. **It has not yet been run in Safari on an iP
 
 | Area | Status |
 |---|---|
-| Pure logic (Delaunay, similarity fit, affine/bilinear maps, keyframes, tracker identity through occlusion, swap/merge, gap filling, One Euro, mesh build, frame selection/timing, presets, garment grid) | **21 Node unit tests, all passing** (`npm test`). |
+| Pure logic (Delaunay, similarity fit, affine/bilinear maps, keyframes, tracker identity through occlusion, swap/merge, gap filling, One Euro, mesh build, frame selection/timing, presets, garment grid) | **34 Node unit tests, all passing** (incl. WSOLA, voice detection, take fitting, body rig, hole filling) (`npm test`). |
 | All modules | Parse-checked with Node; all cross-module imports resolve. |
 | Browser pipeline (storage, encode, decode + pixel check, WebGL warp, model start-up) | Implemented as in-app **self-tests** (Settings). **Not yet executed** — the build environment had no browser and no access to the CDN or model hosts. |
 | End-to-end on iPhone 16 Pro Safari | **Not yet executed.** Use the walkthrough in §4. The v0.1 acceptance criteria should be treated as unverified until that run passes. |

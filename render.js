@@ -14,7 +14,7 @@ export async function renderProject(project, ctx, opts) {
   const { file, meta, profiles, wardrobe, analysis, motionParams } = ctx;
   const plan = project.plan;
   const [a, b] = opts.range || [0, plan.frames - 1];
-  const rt = await prepareRuntime(project, { profiles, wardrobe, analysis, motionParams });
+  const rt = await prepareRuntime(project, { profiles, wardrobe, analysis, motionParams, plate: ctx.plate, background: ctx.background });
   const result = { previews: new Map(), originals: new Map(), stats: { faces: 0, garments: 0, hair: 0, recolor: 0, frames: 0 }, warnings: [...rt.warnings], range: [a, b] };
   if (plan.photo) {
     // Poster / photo: one full-resolution composite, exported as PNG (lossless) or JPEG.
@@ -37,7 +37,7 @@ export async function renderProject(project, ctx, opts) {
   let writer = null;
   if (opts.encode) {
     writer = new VideoWriter(rt.work, plan);
-    await writer.start({ audioFile: file, meta, includeAudio: opts.includeAudio !== false });
+    await writer.start({ audioFile: file, meta, includeAudio: opts.includeAudio !== false, audioBuffer: ctx.audioBuffer || null });
   }
   const t0 = performance.now();
   try {

@@ -209,7 +209,7 @@ export async function codecSupport() {
 /** MP4 writer. Mediabunny when available, else MediaRecorder (real-time paced). */
 export class VideoWriter {
   constructor(canvas, plan) { this.canvas = canvas; this.plan = plan; this.mode = null; this.notes = []; }
-  async start({ audioFile, meta, includeAudio = true } = {}) {
+  async start({ audioFile, meta, includeAudio = true, audioBuffer = null } = {}) {
     const mb = await mediabunny();
     if (mb) {
       const codecs = ['avc', 'hevc', 'vp9'];
@@ -221,7 +221,8 @@ export class VideoWriter {
         this.output = new mb.Output({ format: new mb.Mp4OutputFormat({ fastStart: 'in-memory' }), target: this.target });
         this.vsrc = new mb.CanvasSource(this.canvas, { codec: vcodec, bitrate: mb.QUALITY_HIGH });
         this.output.addVideoTrack(this.vsrc, { frameRate: this.plan.fps });
-        if (includeAudio && meta?.audio?.length) await this._setupAudio(audioFile);
+        if (includeAudio && audioBuffer) await this._setupBufferAudio(audioBuffer);
+        else if (includeAudio && meta?.audio?.length) await this._setupAudio(audioFile);
         await this.output.start();
         if (this._pendingAudio) await this._pendingAudio();
         if (vcodec !== 'avc') this.notes.push(`H.264 encoding unsupported here; using ${vcodec.toUpperCase()} in MP4.`);
@@ -232,6 +233,16 @@ export class VideoWriter {
     this.mode = 'recorder';
     this.frames = [];
     this.notes.push('MediaRecorder fallback: frames are buffered then replayed in real time; audio is not included.');
+  }
+  /** Use a prepared AudioBuffer (e.g. the Dub Studio mix) as the soundtrack. */
+  async _setupBufferAudio(buf) {
+    const mb = this.mb; let acodec = null;
+    for (const c of ['aac', 'opus']) { try { if (await mb.canEncodeAudio(c, { numberOfChannels: buf.numberOfChannels, sampleRate: buf.sampleRate })) { acodec = c; break; } } catch {} }
+    if (!acodec) { this.notes.push('This browser cannot encode AAC/Opus audio: export will be silent.'); return; }
+    const asrc = new mb.AudioBufferSource({ codec: acodec, bitrate: mb.QUALITY_HIGH });
+    this.output.addAudioTrack(asrc);
+    this._pendingAudio = async () => { await asrc.add(buf); asrc.close(); this.audioSeconds = buf.duration; };
+    this.notes.push(`Dubbed soundtrack mixed in (${acodec.toUpperCase()}).`);
   }
   async _setupAudio(file) {
     const mb = this.mb;

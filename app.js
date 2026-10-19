@@ -1,4 +1,4 @@
-// RECAST AI+ v0.1 — application shell and screens.
+// RECAST AI+ v0.2 — application shell and screens.
 import { h, $, toast, confirmBox, slider, check, seg, chip, progressBar, fileButton, timecode, downloadBlob, shareFile, icon } from './ui.js';
 import { db, uid, storageInfo, requestPersist } from './db.js';
 import { MODELS, UNAVAILABLE_MODELS, modelStatus, downloadModel, importModel, deleteModel, hasModel, getTask, runtime as mpRuntime, loadVision, disposeAll } from './models.js';
@@ -10,6 +10,8 @@ import { prepareRuntime, composeFrame, drawTracking, disposeRuntime, DEFAULT_ENT
 import { interpKeys, clamp } from './geometry.js';
 import { SLOTS, VIDEO_SLOTS, analyzeReference, missingViews, extractHair, newProfile, blobToCanvas, recolorCanvas } from './profile.js';
 import { renderProject } from './render.js';
+import { analyzeBody, buildCleanPlate } from './plate.js';
+import * as Dub from './dub.js';
 import { capabilityTest, fmtBytes } from './caps.js';
 import { runSelfTests } from './selftest.js';
 
@@ -29,10 +31,11 @@ export const MODES = [
   { key: 'full', name: 'Full Recast', status: 'experimental', desc: 'Face + hair + garments together. No body reshaping or background reconstruction in v0.1.' },
   { key: 'group', name: 'Group Recast', status: 'functional', desc: 'Different characters for several actors, rendered sequentially per frame.' },
   { key: 'performance', name: 'Performance Match', status: 'functional', desc: 'Lightest smoothing and full expression transfer: exact source timing over polish.' },
+  { key: 'animate', name: 'Full-Body Animate', status: 'experimental', desc: 'Like Wan Animate, on your phone: your full-body photo is rigged and driven by the actor’s motion, in the original scene (with a clean plate) or on a new background. 2D warping: turning around and crossed limbs look wrong.' },
   { key: 'manual', name: 'Manual VFX Recast', status: 'partial', desc: 'Keyframes, restore brush, per-frame overrides. Mesh deformation handles are V0.2.' },
 ];
 const statusChip = s => chip(s, s === 'functional' ? 'ok' : s === 'basic' || s === 'partial' ? 'v' : s === 'experimental' ? 'warn' : 'bad');
-const STEPS = [['import', 'Source'], ['actors', 'Actors'], ['cast', 'Cast'], ['motion', 'MotionLock'], ['editor', 'Editor'], ['render', 'Render'], ['export', 'Export']];
+const STEPS = [['import', 'Source'], ['actors', 'Actors'], ['cast', 'Cast'], ['motion', 'MotionLock'], ['editor', 'Editor'], ['dub', 'Dub'], ['render', 'Render'], ['export', 'Export']];
 
 // ───────────────────────── boot ─────────────────────────
 async function boot() {
@@ -70,6 +73,11 @@ async function grabber() {
   if (!S.grabber) S.grabber = await new FrameGrabber(S.file, p.meta, p.plan).init();
   return S.grabber;
 }
+async function stageAssets(p) {
+  const plate = p.plateAt ? (await db.get('renders', 'plate:' + p.id))?.blob || null : null;
+  const background = p.bgAt ? (await db.get('renders', 'bg:' + p.id))?.blob || null : null;
+  return { plate, background };
+}
 function dropRuntime() { if (S.rt) disposeRuntime(S.rt); S.rt = null; S.rtKey = ''; }
 const motionParams = () => S.project.motion || { minCutoff: 1.2, beta: 0.02, maxGap: 6 };
 async function getRuntime() {
@@ -78,10 +86,11 @@ async function getRuntime() {
     cast: p.cast.map(e => [e.id, e.trackId, e.profileId, e.hair.on, e.top.garmentId, e.top.clip, e.bottom.garmentId, e.bottom.clip, e.recolor.on]),
     prof: p.cast.map(e => { const pr = S.profiles.find(x => x.id === e.profileId); return pr ? [pr.updatedAt || pr.createdAt, pr.consent ? 1 : 0] : 0; }),
     ward: S.wardrobe.map(w => [w.id, w.updatedAt || w.createdAt]), m: motionParams(), a: p.analysis?.at,
+    body: p.cast.map(e => e.body?.on), stage: p.stage, plate: p.plateAt, bg: p.bgAt,
   });
   if (S.rt && S.rtKey === key) return S.rt;
   dropRuntime();
-  S.rt = await prepareRuntime(p, { profiles: S.profiles, wardrobe: S.wardrobe, analysis: p.analysis, motionParams: motionParams() });
+  S.rt = await prepareRuntime(p, { profiles: S.profiles, wardrobe: S.wardrobe, analysis: p.analysis, motionParams: motionParams(), ...(await stageAssets(p)) });
   S.rtKey = key;
   return S.rt;
 }
@@ -102,8 +111,8 @@ function setTabs(active) {
 }
 function steps(pid, cur) {
   const p = S.project, idx = STEPS.findIndex(s => s[0] === cur);
-  const done = { import: !!p.meta, actors: !!p.analysis, cast: p.cast.some(e => e.profileId), motion: !!p.analysis, editor: !!p.analysis, render: !!S.results.get(pid), export: !!p.export };
-  const list = p.meta?.kind === 'photo' ? STEPS.filter(s => s[0] !== 'motion') : STEPS;
+  const done = { import: !!p.meta, actors: !!p.analysis, cast: p.cast.some(e => e.profileId), motion: !!p.analysis, editor: !!p.analysis, render: !!S.results.get(pid), export: !!p.export, dub: !!p.dub?.lines?.some(l => l.take) };
+  const list = p.meta?.kind === 'photo' ? STEPS.filter(s => s[0] !== 'motion' && s[0] !== 'dub') : STEPS;
   return h('nav', { class: 'steps', 'aria-label': 'Recast steps' }, list.map(([k, l], i) => h('a', { href: `#/p/${pid}/${k}`, class: (k === cur ? 'on' : done[k] ? 'done' : ''), 'aria-current': k === cur ? 'step' : null }, h('span', { class: 'n' }, i + 1), l)));
 }
 const callout = (txt, kind = '') => h('div', { class: 'note ' + kind }, txt);
@@ -159,7 +168,7 @@ async function dashboard() {
         } }, 'Delete'))));
   }
   return [
-    h('div', { class: 'hero-slate' }, h('span', { class: 'eyebrow' }, 'Private · on-device · v0.1'), h('h1', null, 'Put yourself in the scene, or on the poster.')),
+    h('div', { class: 'hero-slate' }, h('span', { class: 'eyebrow' }, 'Private · on-device · v0.2'), h('h1', null, 'Put yourself in the scene, or on the poster.')),
     h('a', { class: 'create', href: '#/new' }, h('span', { class: 'plus' }, '+ CREATE NEW RECAST'), h('span', { class: 'muted small' }, 'Video scene or photo poster → actor → your photos → export')),
     missing.length ? callout(h('span', null, 'Install the required models first: ', missing.map(m => m.name).join(', '), '. ', h('a', { href: '#/models' }, 'Open Model Manager')), 'warn') : null,
     panel(h('div', { class: 'row between' }, h('h2', null, 'Projects'), h('div', { class: 'row' }, fileButton('Import project', '.json,application/json', importProjectFile, { cls: 'btn sm ghost' }), h('a', { class: 'btn sm ghost', href: '#/queue' }, 'Render queue'))), list),
@@ -184,7 +193,7 @@ async function importProjectFile(f) {
 // ───────────────────────── 2. New project ─────────────────────────
 function newProject() {
   setTop('New Recast Project', '#/');
-  const st = { name: 'Scene ' + new Date().toLocaleDateString(undefined, { month: 'short', day: 'numeric' }), mode: 'face', preset: VIDEO_PRESETS.includes(S.settings.preset) ? S.settings.preset : 'preview', hair: false, outfit: false };
+  const st = { name: 'Scene ' + new Date().toLocaleDateString(undefined, { month: 'short', day: 'numeric' }), mode: 'face', preset: VIDEO_PRESETS.includes(S.settings.preset) ? S.settings.preset : 'preview', hair: false, outfit: false, body: false };
   const modes = h('div', { class: 'grid2' });
   const drawModes = () => modes.replaceChildren(...MODES.map(m => h('button', { type: 'button', class: 'panel', style: { textAlign: 'left', cursor: 'pointer', borderColor: st.mode === m.key ? 'var(--violet)' : '' }, 'aria-pressed': String(st.mode === m.key), onclick: () => { st.mode = m.key; drawModes(); } },
     h('div', { class: 'row between' }, h('h3', null, m.name), statusChip(m.status)), h('p', { class: 'muted small' }, m.desc))));
@@ -196,12 +205,14 @@ function newProject() {
     panel(h('h2', null, 'What to replace'),
       h('p', { class: 'muted small' }, 'Your face always replaces the actor’s face. Choose whether hair and clothes change too. Unchecked = the original actor’s hair or outfit stays exactly as filmed.'),
       check('Change hair to my hairstyle', st.hair, v => (st.hair = v), 'np-hair'),
-      check('Change outfit (garment overlay or recolor)', st.outfit, v => (st.outfit = v), 'np-outfit')),
+      check('Change outfit (garment overlay or recolor)', st.outfit, v => (st.outfit = v), 'np-outfit'),
+      check('Replace whole body with my full-body photo (Animate, experimental)', st.body, v => { st.body = v; if (v) { st.mode = 'animate'; drawModes(); } }, 'np-body'),
+      h('p', { class: 'muted small' }, 'Whole body uses the full-body photo in your character profile, so your own hair and clothes from that photo come along.')),
     panel(h('h2', null, 'Recast mode'), modes),
     panel(h('h2', null, 'Video preset'), h('p', { class: 'muted small' }, 'Photos and posters always process at full resolution (up to 3072px).'), seg(VIDEO_PRESETS.map(k => [k, PRESETS[k].label]), st.preset, k => { st.preset = k; presetNote.textContent = PRESETS[k].note; }), presetNote),
     h('button', { class: 'btn primary block', onclick: async () => {
       const id = uid('r');
-      const p = { id, name: st.name.trim() || 'Untitled scene', mode: st.mode, preset: st.preset, defaults: { hair: st.hair, outfit: st.outfit }, createdAt: Date.now(), updatedAt: Date.now(), cast: [], selected: [], restore: [], motion: st.mode === 'performance' ? { minCutoff: 3.5, beta: 0.05, maxGap: 3 } : { minCutoff: 1.2, beta: 0.02, maxGap: 6 } };
+      const p = { id, name: st.name.trim() || 'Untitled scene', mode: st.mode, preset: st.preset, defaults: { hair: st.hair, outfit: st.outfit, body: st.body || st.mode === 'animate' }, stage: { mode: 'scene', color: '#101014' }, createdAt: Date.now(), updatedAt: Date.now(), cast: [], selected: [], restore: [], motion: st.mode === 'performance' ? { minCutoff: 3.5, beta: 0.05, maxGap: 3 } : { minCutoff: 1.2, beta: 0.02, maxGap: 6 } };
       await db.put('projects', p);
       S.project = p; S.file = null; S.grabber = null; dropRuntime();
       location.hash = `#/p/${id}/import`;
@@ -212,10 +223,10 @@ function newProject() {
 // ───────────────────────── project router ─────────────────────────
 async function projectScreen(pid, step) {
   const p = await openProject(pid);
-  const need = { actors: 'meta', cast: 'analysis', motion: 'analysis', editor: 'analysis', render: 'analysis', export: null };
+  const need = { actors: 'meta', cast: 'analysis', motion: 'analysis', editor: 'analysis', dub: null, render: 'analysis', export: null };
   if (step !== 'import' && step !== 'export' && !p.meta) { location.hash = `#/p/${pid}/import`; return []; }
   if (need[step] === 'analysis' && !p.analysis) return [steps(pid, step), callout('Run actor detection first.', 'warn'), h('a', { class: 'btn primary', href: `#/p/${pid}/actors` }, 'Go to Actor Detection')];
-  const fn = { import: importScreen, actors: actorsScreen, cast: castScreen, motion: motionScreen, editor: editorScreen, render: renderScreen, export: exportScreen }[step];
+  const fn = { import: importScreen, actors: actorsScreen, cast: castScreen, motion: motionScreen, editor: editorScreen, dub: dubScreen, render: renderScreen, export: exportScreen }[step];
   if (!fn) throw new Error('Unknown step ' + step);
   setTop(p.name, '#/');
   return [steps(pid, step), ...[await fn(p)].flat()];
@@ -398,6 +409,7 @@ function applyModeDefaults(e, mode, prof, defaults) {
   e.face.on = mode !== 'wardrobe';
   e.hair.on = defaults ? !!defaults.hair : ['hairface', 'full', 'group'].includes(mode) && !!prof?.hair;
   e.outfit = { on: defaults ? !!defaults.outfit : ['wardrobe', 'full', 'group'].includes(mode) };
+  e.body = { ...(e.body || { light: 0.6, opacity: 1 }), on: defaults?.body ?? mode === 'animate' };
   if (['wardrobe', 'full', 'group'].includes(mode)) { e.top.garmentId = pre.top || null; e.bottom.garmentId = pre.bottom || null; }
   if (mode === 'wardrobe' && !e.top.garmentId && !e.bottom.garmentId) e.recolor.on = true;
   if (mode === 'performance') { e.face.motion = 1; e.face.light = 0.4; }
@@ -436,6 +448,8 @@ async function castScreen(p) {
           check('Replace face', e.face.on, v => { e.face.on = v; saveProject(); }),
           check('Change hair (use my hairstyle)', e.hair.on, v => { e.hair.on = v; saveProject(); draw(); }),
           h('p', { class: 'muted small', style: { marginLeft: '30px' } }, e.hair.on ? 'Your hair layer is placed over the actor’s head.' : 'Keeping the original actor’s hair.'),
+          check('Replace whole body (Animate)', !!e.body?.on, v => { e.body = { ...(e.body || { light: 0.6, opacity: 1 }), on: v }; saveProject(); draw(); }),
+          h('p', { class: 'muted small', style: { marginLeft: '30px' } }, e.body?.on ? (prof?.body?.ok ? 'Your full-body photo follows this actor’s motion.' : 'Needs an analyzed full-body photo on the character.') : 'Keeping the actor’s body; only the parts checked below change.'),
           check('Change outfit', outfitOn(e), v => { e.outfit = { on: v }; saveProject(); draw(); }),
           h('p', { class: 'muted small', style: { marginLeft: '30px' } }, outfitOn(e) ? 'Pick a garment and/or recolor below.' : 'Keeping the original actor’s outfit exactly as filmed.')),
         e.hair.on && !prof?.hair ? callout(h('span', null, 'Hair is on, but this character has no hair layer yet. ', prof ? h('a', { href: `#/character/${prof.id}` }, 'Extract it in the Character Builder') : null), 'warn') : null,
@@ -597,7 +611,7 @@ async function editorScreen(p) {
   const change = (fn) => (v) => { fn(v); saveProject(); paint(); };
   const drawInspector = () => {
     const e = cur(); if (!e) { insp.replaceChildren(h('p', { class: 'muted' }, 'No layer.')); return; }
-    const tabs = seg([['transform', 'Transform'], ['face', 'Face'], ['hair', 'Hair'], ['ward', 'Wardrobe'], ['repair', 'Repair']], st.tab, t => { st.tab = t; drawInspector(); });
+    const tabs = seg([['transform', 'Transform'], ['face', 'Face'], ['body', 'Body'], ['hair', 'Hair'], ['ward', 'Wardrobe'], ['repair', 'Repair']], st.tab, t => { st.tab = t; drawInspector(); });
     const body = [];
     const prof = S.profiles.find(x => x.id === e.profileId);
     if (st.tab === 'transform') {
@@ -633,6 +647,36 @@ async function editorScreen(p) {
         check('Keep source mouth interior (teeth/tongue when speaking)', e.face.keepMouth, change(v => (e.face.keepMouth = v))),
         check('Keep source eyes (more natural blinks, less identity)', e.face.keepEyes, change(v => (e.face.keepEyes = v))),
         h('p', { class: 'muted small' }, 'Face shape: the reference is warped onto the actor’s mesh, so jaw and proportions follow the actor more than you. Eye, brow, nose and mouth appearance come from your photo; their motion comes from the actor.'));
+    } else if (st.tab === 'body') {
+      const stg = p.stage = p.stage || { mode: 'scene', color: '#101014' };
+      const plateStatus = h('p', { class: 'small muted' });
+      body.push(
+        check('Replace whole body with my full-body photo', !!e.body?.on, v => { e.body = { ...(e.body || { light: 0.6, opacity: 1 }), on: v }; saveProject(); dropRuntime(); paint(); drawInspector(); }),
+        prof?.body?.ok ? null : callout(h('span', null, 'Add a full-body photo to this character first. ', prof ? h('a', { href: `#/character/${prof.id}` }, 'Open Character Builder') : null), 'warn'),
+        e.body?.on ? slider('Match scene light', e.body.light ?? 0.6, { min: 0, max: 1, step: 0.05, oninput: change(v => (e.body.light = v)) }) : null,
+        e.body?.on ? slider('Body opacity', e.body.opacity ?? 1, { min: 0, max: 1, step: 0.01, oninput: change(v => (e.body.opacity = v)) }) : null,
+        h('hr', { class: 'sep' }),
+        h('h3', null, 'Stage'),
+        seg([['scene', 'Keep the original scene'], ['background', 'New background']], stg.mode, v => { stg.mode = v; saveProject(); dropRuntime(); paint(); drawInspector(); }),
+        stg.mode === 'background' ? h('div', { class: 'stack' },
+          h('div', { class: 'row' }, h('span', { class: 'small muted' }, 'Color'), h('input', { type: 'color', value: stg.color || '#101014', oninput: ev => { stg.color = ev.target.value; saveProject(); dropRuntime(); paint(); } }),
+            fileButton(p.bgAt ? 'Replace image' : 'Background image', 'image/*', async f => { await db.put('renders', { id: 'bg:' + p.id, blob: f, at: Date.now() }); p.bgAt = Date.now(); saveProject(); dropRuntime(); paint(); drawInspector(); }, { cls: 'btn sm' }),
+            p.bgAt ? h('button', { class: 'btn sm ghost danger', onclick: async () => { await db.del('renders', 'bg:' + p.id); p.bgAt = null; saveProject(); dropRuntime(); paint(); drawInspector(); } }, 'Remove image') : null),
+          h('p', { class: 'muted small' }, 'Only actors with whole-body replacement appear on a new background; everyone else is dropped.')) : null,
+        h('hr', { class: 'sep' }),
+        h('h3', null, 'Clean plate (removes the original actor)'),
+        h('p', { class: 'muted small' }, p.plan.photo ? 'For a poster, upload a photo of the same place without the actor. Without one, the gap is filled with soft colour from around the actor.' : 'Built from frames where the background was visible. Works for a still (tripod) camera; a moving camera needs an uploaded plate.'),
+        h('div', { class: 'row' },
+          h('button', { class: 'btn sm', onclick: async ev => {
+            ev.target.disabled = true;
+            try { const r = await buildCleanPlate(g, p.plan, { samples: p.plan.photo ? 1 : 24, onProgress: (d, n) => (plateStatus.textContent = `Sampling frame ${d}/${n}…`) }); await db.put('renders', { id: 'plate:' + p.id, blob: r.blob, at: Date.now() }); p.plateAt = Date.now(); saveProject(); dropRuntime(); plateStatus.textContent = `Plate built from ${r.samples} frames · ${(r.holes * 100).toFixed(1)}% never visible (filled softly)`; paint(); }
+            catch (err) { toast(err.message, true); }
+            ev.target.disabled = false;
+          } }, p.plateAt ? 'Rebuild plate' : 'Build clean plate'),
+          fileButton('Upload plate', 'image/*', async f => { await db.put('renders', { id: 'plate:' + p.id, blob: f, at: Date.now() }); p.plateAt = Date.now(); saveProject(); dropRuntime(); paint(); drawInspector(); }, { cls: 'btn sm' }),
+          p.plateAt ? h('button', { class: 'btn sm ghost danger', onclick: async () => { await db.del('renders', 'plate:' + p.id); p.plateAt = null; saveProject(); dropRuntime(); paint(); drawInspector(); } }, 'Remove plate') : null),
+        plateStatus,
+        h('p', { class: 'muted small' }, 'Limits: this is 2D warping of one photo. The rig follows shoulders, elbows, wrists, hips, knees and ankles; fingers, turning around and loose clothing are not simulated.'));
     } else if (st.tab === 'hair') {
       body.push(check('Change hair (unchecked = original actor’s hair)', e.hair.on, v => { e.hair.on = v; saveProject(); dropRuntime(); paint(); drawInspector(); }),
         prof?.hair ? h('p', { class: 'muted small' }, `Hair layer from ${prof.name}. Color, volume and fringe are edited on the character.`) : callout('This character has no hair layer. Extract one in the Character Builder (needs the Multiclass model).', 'warn'),
@@ -679,7 +723,7 @@ async function editorScreen(p) {
   return h('div', { class: 'editor' },
     h('div', { class: 'stack' }, mon, sbs, transport, h('div', { class: 'row between' }, viewSeg, ovChips), info, tl),
     h('div', { class: 'stack side' }, panel(h('h2', null, 'Inspector'), layerBar, insp),
-      h('a', { class: 'btn primary block', href: `#/p/${p.id}/render` }, 'Next: Render')));
+      h('a', { class: 'btn primary block', href: `#/p/${p.id}/${p.plan.photo ? 'render' : 'dub'}` }, p.plan.photo ? 'Next: Render' : 'Next: Dub (optional)')));
 }
 function toggleRange(ranges, k) {
   const i = ranges.findIndex(([a, b]) => k >= a && k <= b);
@@ -709,6 +753,152 @@ async function redetect(p, k0, k1) {
   return k1 - k0 + 1;
 }
 
+
+// ───────────────────────── Dub Studio (v0.2) ─────────────────────────
+const dubCache = { key: '', scene: null, fits: new Map() };
+async function sceneAudio(p) {
+  const key = p.id + ':' + p.plan.start + ':' + p.plan.end;
+  if (dubCache.key !== key) { dubCache.key = key; dubCache.scene = await Dub.extractSceneAudio(S.file, p.plan, mediabunny); dubCache.fits.clear(); }
+  return dubCache.scene;
+}
+async function fittedLine(p, l, scene) {
+  const ck = l.id + ':' + l.take.at + ':' + l.start + ':' + l.end;
+  if (dubCache.fits.has(ck)) return dubCache.fits.get(ck);
+  const rec = await db.get('renders', `take:${p.id}:${l.id}`);
+  if (!rec?.blob) throw new Error('Recording for a line is missing. Record it again.');
+  const buf = await Dub.decodeBlob(rec.blob);
+  const mono = await Dub.resample(Dub.toMono([...Array(buf.numberOfChannels).keys()].map(c => buf.getChannelData(c))), buf.sampleRate, scene.sampleRate);
+  const sr = scene.sampleRate, a = Math.floor(l.start * sr), b = Math.min(scene.length, Math.ceil(l.end * sr));
+  const orig = Dub.toMono([...Array(scene.numberOfChannels).keys()].map(c => scene.getChannelData(c).subarray(a, b)));
+  const fit = Dub.fitTake(mono, sr, l.end - l.start, Math.max(0.05, Dub.rms(orig) * 0.95));
+  dubCache.fits.set(ck, fit);
+  return fit;
+}
+async function buildDubMix(p) {
+  if (!S.file) await openProject(p.id);
+  const scene = await sceneAudio(p), lines = [];
+  for (const l of p.dub.lines) if (l.take && l.enabled !== false) { const f = await fittedLine(p, l, scene); lines.push({ start: l.start, end: l.end, fit: f.samples, gain: l.gain ?? 1 }); }
+  return Dub.mixDub(scene, lines, p.dub);
+}
+let playing = null;
+function stopPlayback() { try { playing?.src.stop(); } catch {} try { playing?.video?.pause(); } catch {} playing = null; }
+function playBuffer(buf, offset = 0, dur, video, videoTime) {
+  stopPlayback(); const ac = Dub.audioCtx(); ac.resume();
+  const src = ac.createBufferSource(); src.buffer = buf; src.connect(ac.destination);
+  if (video) { video.currentTime = videoTime; video.muted = true; video.play().catch(() => {}); }
+  src.start(0, offset, dur); playing = { src, video }; src.onended = () => { if (playing?.src === src) { video?.pause(); playing = null; } };
+}
+
+async function dubScreen(p) {
+  if (p.plan.photo) return [callout('Posters have no sound to dub.')];
+  S.cleanup.push(stopPlayback);
+  const d = p.dub = p.dub || { lines: [], mode: 'duck', duckDb: -28, room: 0.15, tone: 0.1, voiceGain: 1, model: 'whisper-base', voiceProfileId: p.cast.find(e => e.profileId)?.profileId || null };
+  const wrap = h('div', { class: 'stack' }), status = h('p', { class: 'small muted mono' });
+  const url = URL.createObjectURL(S.file); S.cleanup.push(() => URL.revokeObjectURL(url));
+  const video = h('video', { src: url, playsInline: true, muted: true, preload: 'auto' });
+  const lineDur = l => (l.end - l.start).toFixed(2);
+  const prof = () => S.profiles.find(x => x.id === d.voiceProfileId);
+  const consentOk = () => { const pr = prof(); return pr && (pr.self || pr.consent); };
+  const find = async (how) => {
+    try {
+      status.textContent = 'Reading scene audio…';
+      const scene = await sceneAudio(p);
+      const mono = Dub.toMono([...Array(scene.numberOfChannels).keys()].map(c => scene.getChannelData(c)));
+      let found;
+      if (how === 'whisper') found = await Dub.transcribe(await Dub.resample(mono, scene.sampleRate, 16000), { model: d.model, onStatus: t => (status.textContent = t) });
+      else found = Dub.detectVoice(mono, scene.sampleRate).map(v => ({ ...v, text: '' }));
+      const dur = p.plan.end - p.plan.start;
+      d.lines = found.filter(f => f.end > f.start && f.start < dur).map(f => ({ id: uid('l'), start: +Math.max(0, f.start).toFixed(3), end: +Math.min(dur, f.end).toFixed(3), text: f.text || '', enabled: true }));
+      saveProject(); status.textContent = `${d.lines.length} line(s) found.`; draw();
+    } catch (e) { console.error(e); status.textContent = ''; toast((how === 'whisper' ? 'Transcription failed: ' : 'Detection failed: ') + e.message, true, 8000); }
+  };
+  const teleprompter = (l) => {
+    if (!consentOk()) { toast('Choose a voice character with consent first.', true); return; }
+    const bar = progressBar(), msg = h('p', { class: 'muted small' }, 'Tap Record. After three beeps, say the line as the bar fills.');
+    const result = h('div', { class: 'stack' });
+    let mic = null;
+    const close = () => { mic?.close(); m.remove(); draw(); };
+    const rec = h('button', { class: 'btn primary', onclick: async () => {
+      rec.disabled = true; const ac = Dub.audioCtx(); await ac.resume();
+      try { mic = mic || (await new Dub.MicRecorder().open()); } catch (e) { toast('Microphone not available: ' + e.message, true); rec.disabled = false; return; }
+      for (let i = 3; i >= 1; i--) { msg.textContent = String(i); Dub.beep(i === 1 ? 1320 : 880); await new Promise(r => setTimeout(r, 700)); }
+      msg.textContent = 'Speak now'; mic.start();
+      const total = (l.end - l.start) + 0.8, t0 = performance.now();
+      await new Promise(res => { const tick = () => { const e = (performance.now() - t0) / 1000; bar.set(e / total); if (e >= total) res(); else requestAnimationFrame(tick); }; tick(); });
+      const blob = await mic.stop(); msg.textContent = 'Fitting your take to the line…';
+      try {
+        await db.put('renders', { id: `take:${p.id}:${l.id}`, blob, at: Date.now() });
+        l.take = { at: Date.now(), source: 'mic' };
+        const f = await fittedLine(p, l, await sceneAudio(p)); l.take.stretch = f.stretch; l.take.warn = f.warn; saveProject();
+        msg.textContent = f.warn || `Fitted: ${f.rawDur.toFixed(2)} s → ${lineDur(l)} s (×${f.stretch.toFixed(2)})`;
+        const sr = (await sceneAudio(p)).sampleRate, b = Dub.audioCtx().createBuffer(1, f.samples.length, sr); b.copyToChannel(f.samples, 0);
+        result.replaceChildren(h('div', { class: 'row' }, h('button', { class: 'btn sm', onclick: () => playBuffer(b, 0, undefined, video, p.plan.start + l.start) }, '▶ Hear take with picture'), h('button', { class: 'btn sm', onclick: close }, 'Use take')));
+      } catch (e) { msg.textContent = 'Could not process the take: ' + e.message; }
+      rec.disabled = false; rec.textContent = 'Retake';
+    } }, l.take ? 'Retake' : 'Record');
+    const m = h('div', { class: 'modal' }, h('div', { class: 'box' },
+      h('span', { class: 'eyebrow mono' }, `${timecode(Math.round(l.start * p.plan.fps), p.plan.fps)} · ${lineDur(l)} s · voice of ${prof()?.name}`),
+      h('h1', { style: { fontSize: 'clamp(22px,6vw,30px)' } }, l.text || '(no text: say the line as the actor does)'),
+      bar, msg,
+      h('div', { class: 'row' }, h('button', { class: 'btn', onclick: async () => playBuffer(await sceneAudio(p), l.start, l.end - l.start, video, p.plan.start + l.start) }, '▶ Original line'), rec, h('button', { class: 'btn ghost', onclick: close }, 'Close')),
+      result));
+    document.body.appendChild(m);
+  };
+  const draw = () => {
+    const rows = d.lines.map((l, i) => h('div', { class: 'panel', style: { gap: '8px', borderColor: l.take ? 'rgba(79,209,161,.45)' : '' } },
+      h('div', { class: 'row between' }, h('span', { class: 'mono small' }, `#${i + 1} · ${l.start.toFixed(2)}–${l.end.toFixed(2)} s (${lineDur(l)} s)`), h('div', { class: 'row' }, l.take ? chip(l.take.source === 'import' ? 'imported' : 'recorded', 'ok') : chip('original voice'), check('Use', l.enabled !== false, v => { l.enabled = v; saveProject(); })) ),
+      h('textarea', { rows: 2, placeholder: 'Line text (for the teleprompter)', value: l.text, oninput: e => { l.text = e.target.value; saveProject(); } }),
+      h('div', { class: 'row' },
+        h('label', { class: 'small muted row' }, 'Start', h('input', { type: 'number', step: 0.05, value: l.start, style: { width: '86px' }, onchange: e => { l.start = Math.max(0, +e.target.value); saveProject(); draw(); } })),
+        h('label', { class: 'small muted row' }, 'End', h('input', { type: 'number', step: 0.05, value: l.end, style: { width: '86px' }, onchange: e => { l.end = Math.max(l.start + 0.2, +e.target.value); saveProject(); draw(); } }))),
+      l.take?.warn ? h('p', { class: 'small', style: { color: 'var(--warn)' } }, l.take.warn) : null,
+      h('div', { class: 'row' },
+        h('button', { class: 'btn sm', onclick: async () => playBuffer(await sceneAudio(p), l.start, l.end - l.start, video, p.plan.start + l.start) }, '▶ Original'),
+        h('button', { class: 'btn sm primary', onclick: () => teleprompter(l) }, l.take ? '● Retake' : '● Record'),
+        fileButton('Import audio', 'audio/*,video/*', async f => {
+          if (!consentOk()) { toast('Choose a voice character with consent first.', true); return; }
+          await db.put('renders', { id: `take:${p.id}:${l.id}`, blob: f, at: Date.now() }); l.take = { at: Date.now(), source: 'import' };
+          try { const fit = await fittedLine(p, l, await sceneAudio(p)); l.take.stretch = fit.stretch; l.take.warn = fit.warn; } catch (e) { toast(e.message, true); }
+          saveProject(); draw();
+        }, { cls: 'btn sm' }),
+        l.take ? h('button', { class: 'btn sm', onclick: async () => { const sc = await sceneAudio(p), f = await fittedLine(p, l, sc), b = Dub.audioCtx().createBuffer(1, f.samples.length, sc.sampleRate); b.copyToChannel(f.samples, 0); playBuffer(b, 0, undefined, video, p.plan.start + l.start); } }, '▶ Take') : null,
+        l.take ? h('button', { class: 'btn sm ghost danger', onclick: async () => { await db.del('renders', `take:${p.id}:${l.id}`); l.take = null; saveProject(); draw(); } }, 'Remove take') : null,
+        h('button', { class: 'btn sm ghost danger', onclick: async () => { await db.del('renders', `take:${p.id}:${l.id}`); d.lines = d.lines.filter(x => x !== l); saveProject(); draw(); } }, 'Delete line'))));
+    const done = d.lines.filter(l => l.take).length;
+    wrap.replaceChildren(
+      h('div', { class: 'monitor' }, video, h('div', { class: 'tag' }, 'DUB')),
+      panel(h('h2', null, 'Dub Studio'),
+        h('p', { class: 'muted small' }, 'Your voice replaces the original actor’s lines. Each take is trimmed and time-fitted to the original line (pitch kept), so it lands where the actor’s mouth moves.'),
+        h('label', { class: 'f' }, 'Voice of', h('select', { onchange: e => { d.voiceProfileId = e.target.value || null; saveProject(); draw(); } }, h('option', { value: '' }, 'Choose a character'), S.profiles.map(pr => h('option', { value: pr.id, selected: pr.id === d.voiceProfileId }, pr.name + (pr.self ? ' (me)' : pr.consent ? '' : ' — consent missing'))))),
+        prof() && !consentOk() ? callout('This person has no recorded consent. Their voice cannot be used.', 'bad') : null,
+        p.meta.audio.length ? null : callout('This clip has no audio track. You can still add lines by hand and record them.', 'warn'),
+        h('div', { class: 'row' },
+          h('button', { class: 'btn primary', disabled: !p.meta.audio.length, onclick: () => find('whisper') }, 'Transcribe lines (Whisper)'),
+          h('select', { 'aria-label': 'Whisper model', style: { width: 'auto' }, onchange: e => { d.model = e.target.value; saveProject(); } }, h('option', { value: 'whisper-tiny', selected: d.model === 'whisper-tiny' }, 'tiny · ≈40 MB'), h('option', { value: 'whisper-base', selected: d.model === 'whisper-base' }, 'base · ≈80 MB')),
+          h('button', { class: 'btn', disabled: !p.meta.audio.length, onclick: () => find('vad') }, 'Detect lines (no download)'),
+          h('button', { class: 'btn ghost', onclick: () => { const t = Math.max(0, (video.currentTime || p.plan.start) - p.plan.start); d.lines.push({ id: uid('l'), start: +t.toFixed(2), end: +Math.min(p.plan.end - p.plan.start, t + 2).toFixed(2), text: '', enabled: true }); d.lines.sort((a, b) => a.start - b.start); saveProject(); draw(); } }, '+ Line at playhead')),
+        status,
+        h('p', { class: 'muted small' }, 'Whisper downloads from Hugging Face once, then runs on this device. The audio never leaves the phone.')),
+      d.lines.length ? h('div', { class: 'stack' }, h('div', { class: 'row between' }, h('h2', null, `Lines · ${done}/${d.lines.length} dubbed`)), rows) : null,
+      panel(h('h2', null, 'Mix'),
+        h('label', { class: 'f' }, 'Original voice during dubbed lines', seg([['duck', 'Lower it'], ['mute', 'Mute it'], ['center', 'Remove centre voice (stereo)']], d.mode, v => { d.mode = v; saveProject(); draw(); })),
+        d.mode === 'duck' ? slider('Lower by', d.duckDb, { min: -45, max: -6, step: 1, fmt: v => `${v} dB`, oninput: v => { d.duckDb = v; saveProject(); } }) : null,
+        d.mode === 'center' && p.meta.audio[0]?.channels < 2 ? callout('Source is mono, so centre removal will mute it instead.', 'warn') : null,
+        slider('Room / reverb', d.room, { min: 0, max: 0.8, step: 0.01, oninput: v => { d.room = v; saveProject(); } }),
+        slider('Match scene tone', d.tone, { min: 0, max: 0.8, step: 0.01, oninput: v => { d.tone = v; saveProject(); } }),
+        slider('Voice level', d.voiceGain, { min: 0.3, max: 2, step: 0.05, oninput: v => { d.voiceGain = v; saveProject(); } }),
+        h('p', { class: 'muted small' }, 'Music and effects under a dubbed line are lowered with the voice unless you use centre removal. A dedicated voice/music separation model is on the roadmap.'),
+        h('div', { class: 'row' },
+          h('button', { class: 'btn primary', disabled: !done, onclick: async ev => { ev.target.disabled = true; try { status.textContent = 'Mixing…'; const mix = await buildDubMix(p); status.textContent = ''; playBuffer(mix, 0, undefined, video, p.plan.start); } catch (e) { toast(e.message, true); } ev.target.disabled = false; } }, '▶ Preview dubbed scene'),
+          h('button', { class: 'btn', onclick: stopPlayback }, 'Stop'),
+          h('button', { class: 'btn', disabled: !done, onclick: async () => { try { const mix = await buildDubMix(p); downloadBlob(Dub.encodeWav([...Array(mix.numberOfChannels).keys()].map(c => mix.getChannelData(c)), mix.sampleRate), `${p.name.replace(/[^\w-]+/g, '_')}_dub.wav`); } catch (e) { toast(e.message, true); } } }, 'Download dub WAV'))),
+      callout('Lip-sync: the mouth follows the original actor’s performance, so keep your delivery close to the original timing. Re-animating lips to new words is not available on-device yet.'),
+      h('a', { class: 'btn primary block', href: `#/p/${p.id}/render` }, 'Next: Render'));
+  };
+  draw();
+  return wrap;
+}
+
 // ───────────────────────── Render & queue ─────────────────────────
 function enqueue(p, opts) {
   const job = { id: uid('j'), projectId: p.id, name: p.name, opts, status: 'queued', progress: 0, created: Date.now() };
@@ -720,7 +910,12 @@ async function pump() {
   S.job = job; job.status = 'running'; job.ctrl = new AbortController(); job.started = performance.now();
   try {
     const p = S.project?.id === job.projectId ? S.project : await openProject(job.projectId);
-    const res = await renderProject(p, { file: S.file, meta: p.meta, profiles: S.profiles, wardrobe: S.wardrobe, analysis: p.analysis, motionParams: p.motion || {} }, {
+    let audioBuffer = null;
+    if (!p.plan.photo && job.opts.encode && job.opts.dub && p.dub?.lines?.some(l => l.take && l.enabled !== false)) {
+      job.info = { phase: 'mixing dub' }; job.onUpdate?.();
+      try { audioBuffer = await buildDubMix(p); } catch (e) { toast('Dub mix failed, using original audio: ' + e.message, true, 7000); }
+    }
+    const res = await renderProject(p, { file: S.file, meta: p.meta, profiles: S.profiles, wardrobe: S.wardrobe, analysis: p.analysis, motionParams: p.motion || {}, audioBuffer, ...(await stageAssets(p)) }, {
       ...job.opts, signal: job.ctrl.signal,
       onProgress: (d, t, info) => { job.progress = d / t; job.info = info; job.done = d; job.total = t; job.onUpdate?.(); if (S.top && (!job._tt || performance.now() - job._tt > 800)) { job._tt = performance.now(); setTop(...S.top); } },
     });
@@ -744,7 +939,7 @@ async function pump() {
 }
 
 async function renderScreen(p) {
-  const opts = { encode: true, disclosure: S.settings.disclosure, includeAudio: true, range: [0, p.plan.frames - 1] };
+  const opts = { encode: true, disclosure: S.settings.disclosure, includeAudio: true, dub: !!p.dub?.lines?.some(l => l.take), range: [0, p.plan.frames - 1] };
   const wrap = h('div', { class: 'stack' });
   const live = h('div', { class: 'stack' });
   const drawLive = () => {
@@ -788,6 +983,7 @@ async function renderScreen(p) {
       rng,
       check('Burn in “AI-edited” disclosure label', opts.disclosure, v => (opts.disclosure = v)),
       p.meta.audio.length ? check('Keep original audio', opts.includeAudio, v => (opts.includeAudio = v)) : h('p', { class: 'muted small' }, 'Source has no audio track.'),
+      p.dub?.lines?.some(l => l.take) ? check(`Use the Dub Studio soundtrack (${p.dub.lines.filter(l => l.take && l.enabled !== false).length} dubbed lines)`, opts.dub, v => (opts.dub = v)) : null,
       h('p', { class: 'muted small' }, `${p.plan.frames} frames at ${p.plan.width}×${p.plan.height}, ${p.plan.fps.toFixed(2)} fps. Progress counts frames actually composited and encoded.`),
       h('div', { class: 'row' }, h('button', { class: 'btn primary', onclick: () => { const j = enqueue(p, { ...opts, range: [...opts.range] }); j.onUpdate = drawLive; drawLive(); } }, 'Start render'), h('a', { class: 'btn ghost', href: '#/queue' }, 'Render queue'))),
     live);
@@ -890,10 +1086,10 @@ async function exportScreen(p) {
 const blobToB64 = b => new Promise(r => { const fr = new FileReader(); fr.onload = () => r(String(fr.result).split(',')[1]); fr.readAsDataURL(b); });
 const b64ToBlob = (b64, type) => fetch(`data:${type};base64,${b64}`).then(r => r.blob());
 function serializeProject(p) {
-  const conv = v => v instanceof Float32Array ? { $f32: Array.from(v) } : v instanceof Uint8ClampedArray ? { $u8c: Array.from(v) } : v instanceof Blob ? null : Array.isArray(v) ? v.map(conv) : v && typeof v === 'object' ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, conv(x)])) : v;
+  const conv = v => v instanceof Float32Array ? { $f32: Array.from(v) } : v instanceof Uint8ClampedArray ? { $u8c: Array.from(v) } : v instanceof Uint8Array ? { $u8: Array.from(v) } : v instanceof Blob ? null : Array.isArray(v) ? v.map(conv) : v && typeof v === 'object' ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, conv(x)])) : v;
   const { export: _x, ...rest } = p; return conv(rest);
 }
-function deserialize(v) { return v && typeof v === 'object' ? (v.$f32 ? Float32Array.from(v.$f32) : v.$u8c ? Uint8ClampedArray.from(v.$u8c) : Array.isArray(v) ? v.map(deserialize) : Object.fromEntries(Object.entries(v).map(([k, x]) => [k, deserialize(x)]))) : v; }
+function deserialize(v) { return v && typeof v === 'object' ? (v.$f32 ? Float32Array.from(v.$f32) : v.$u8c ? Uint8ClampedArray.from(v.$u8c) : v.$u8 ? Uint8Array.from(v.$u8) : Array.isArray(v) ? v.map(deserialize) : Object.fromEntries(Object.entries(v).map(([k, x]) => [k, deserialize(x)]))) : v; }
 
 // ───────────────────────── 5. Character library ─────────────────────────
 async function library() {
@@ -920,6 +1116,7 @@ async function library() {
           const pr = deserialize(d.profile); pr.id = uid('p'); pr.updatedAt = Date.now();
           for (const [k, r] of Object.entries(d.images || {})) { pr.refs[k] = pr.refs[k] || {}; pr.refs[k].blob = await b64ToBlob(r.b64, r.type); if (pr.refs[k].analysis) { if (r.tex) pr.refs[k].analysis.texBlob = await b64ToBlob(r.tex, 'image/jpeg'); else pr.refs[k].analysis = null; } }
           if (d.hair) pr.hair.png = await b64ToBlob(d.hair, 'image/png');
+          if (d.body && pr.body) pr.body.png = await b64ToBlob(d.body, 'image/png'); else if (pr.body) pr.body = null;
           if (!pr.self && !pr.consent) toast('Imported without consent: confirm consent before use.', true);
           await db.put('profiles', pr); toast(`Imported ${pr.name}`); route();
         } catch (e) { toast('Import failed: ' + e.message, true); }
@@ -954,9 +1151,12 @@ async function characterBuilder(id) {
           fileButton(r ? 'Replace' : 'Add photo', 'image/*', async f => {
             pr.refs[s.key] = { blob: f, name: f.name, at: Date.now() };
             if (isFace && ms.face && s.key !== 'hair') { try { toast('Analyzing face…'); pr.refs[s.key].analysis = await analyzeReference(f); } catch (e) { toast('Analysis failed: ' + e.message, true); } }
+            if (s.key === 'body') { try { toast('Rigging your body…'); pr.body = await analyzeBody(f, blobToCanvas); } catch (e) { pr.body = null; toast('Body analysis failed: ' + e.message, true, 7000); } }
             await save(); draw();
           }, { cls: 'btn sm' }),
-          r ? h('button', { class: 'btn sm ghost danger', onclick: async () => { delete pr.refs[s.key]; await save(); draw(); } }, 'Delete') : null));
+          r ? h('button', { class: 'btn sm ghost danger', onclick: async () => { delete pr.refs[s.key]; if (s.key === 'body') pr.body = null; await save(); draw(); } }, 'Delete') : null),
+          s.key === 'body' && r ? (pr.body?.ok ? h('div', { class: 'stack', style: { gap: '4px' } }, chip('rigged for Animate', 'ok'), pr.body.issues?.length ? h('p', { class: 'small', style: { color: 'var(--warn)' } }, pr.body.issues.join(' ')) : null)
+            : h('button', { class: 'btn sm', onclick: async () => { try { pr.body = await analyzeBody(r.blob, blobToCanvas); await save(); draw(); } catch (e) { toast(e.message, true, 7000); } } }, 'Rig body')) : null);
     }));
     const needsAnalysis = ['front', 'left', 'right'].filter(k => pr.refs[k] && !pr.refs[k].analysis);
     const miss = missingViews(pr);
@@ -1007,8 +1207,8 @@ async function characterBuilder(id) {
         h('button', { class: 'btn', onclick: async () => {
           const images = {};
           for (const [k, r] of Object.entries(pr.refs)) if (r.blob) images[k] = { type: r.blob.type, b64: await blobToB64(r.blob), tex: r.analysis?.texBlob ? await blobToB64(r.analysis.texBlob) : null };
-          const clean = JSON.parse(JSON.stringify(serializeProject({ ...pr, refs: Object.fromEntries(Object.entries(pr.refs).map(([k, r]) => [k, { ...r, blob: null, analysis: r.analysis ? { ...r.analysis, texBlob: null } : null }])), hair: pr.hair ? { ...pr.hair, png: null } : null, videos: {} })));
-          const data = { format: 'recast-character', version: 1, profile: clean, images, hair: pr.hair?.png ? await blobToB64(pr.hair.png) : null };
+          const clean = JSON.parse(JSON.stringify(serializeProject({ ...pr, refs: Object.fromEntries(Object.entries(pr.refs).map(([k, r]) => [k, { ...r, blob: null, analysis: r.analysis ? { ...r.analysis, texBlob: null } : null }])), hair: pr.hair ? { ...pr.hair, png: null } : null, body: pr.body ? { ...pr.body, png: null } : null, videos: {} })));
+          const data = { format: 'recast-character', version: 1, profile: clean, images, hair: pr.hair?.png ? await blobToB64(pr.hair.png) : null, body: pr.body?.png ? await blobToB64(pr.body.png) : null };
           downloadBlob(new Blob([JSON.stringify(data)], { type: 'application/json' }), `${pr.name.replace(/[^\w-]+/g, '_')}.recastchar.json`);
         } }, 'Export profile'),
         h('button', { class: 'btn ghost danger', onclick: async () => { if (!(await confirmBox(`Delete ${pr.name}?`, 'All photos, videos and analysis for this character are removed from this device.'))) return; await db.del('profiles', pr.id); await reloadLibrary(); dropRuntime(); location.hash = '#/library'; } }, 'Delete character')));
@@ -1119,7 +1319,7 @@ async function modelManager() {
         h('button', { class: 'btn', onclick: async () => { try { await loadVision(); toast('MediaPipe runtime loaded'); } catch (e) { toast(e.message, true, 7000); } } }, 'Load runtime now'),
         h('button', { class: 'btn ghost', onclick: () => { disposeAll(); toast('Released all model memory'); draw(); } }, 'Release memory')),
       ...cards,
-      panel(h('h2', null, 'Not available in v0.1'), h('div', { class: 'stack' }, UNAVAILABLE_MODELS.map(u => h('div', null, h('div', { class: 'row' }, h('h3', null, u.name), chip('unavailable', 'bad')), h('p', { class: 'small muted' }, u.why))))));
+      panel(h('h2', null, 'Other engines'), h('div', { class: 'stack' }, UNAVAILABLE_MODELS.map(u => h('div', null, h('div', { class: 'row' }, h('h3', null, u.name), u.available ? chip('on demand', 'ok') : chip('unavailable', 'bad')), h('p', { class: 'small muted' }, u.why))))));
   };
   await draw();
   return wrap;
@@ -1151,10 +1351,11 @@ async function settingsScreen() {
       h('div', { class: 'row' }, h('button', { class: 'btn', onclick: async () => toast((await requestPersist()) ? 'Persistent storage granted' : 'Safari declined. Adding to Home Screen improves retention.') }, 'Request persistent storage'),
         h('button', { class: 'btn danger', onclick: async () => { if (!(await confirmBox('Delete all RECAST data?', 'Projects, characters, wardrobe, models and exports on this device will be erased.', 'Erase everything'))) return; disposeAll(); await db.wipe(); S.project = null; S.file = null; await reloadLibrary(); toast('All data erased'); location.hash = '#/'; } }, 'Delete all data'))),
     panel(h('h2', null, 'About & licenses'),
-      h('p', { class: 'small' }, 'RECAST AI+ v0.1 · private, local, static web app.'),
+      h('p', { class: 'small' }, 'RECAST AI+ v0.2 · private, local, static web app.'),
       h('ul', { class: 'small muted' },
         h('li', null, 'MediaPipe Tasks Vision (Google) — Apache-2.0. Pose, Face, Hand Landmarker and Image Segmenter models: Apache-2.0, see each model card.'),
         h('li', null, 'Mediabunny (Vanilagy) — MPL-2.0. MP4/MOV demuxing, decoding and encoding via WebCodecs.'),
+        h('li', null, 'Transformers.js (Hugging Face) — Apache-2.0. Whisper models (OpenAI, ONNX conversions by onnx-community) — MIT.'),
         h('li', null, 'Fonts: Archivo, IBM Plex Sans, IBM Plex Mono — SIL Open Font License.')),
       h('p', { class: 'small muted' }, 'Use this tool only with footage you may edit and with the consent of everyone whose likeness you add. Label shared results as AI-edited.')),
   ];

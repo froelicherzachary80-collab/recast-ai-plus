@@ -19,10 +19,10 @@ uniform sampler2D uTex; uniform float uOpacity; uniform float uGrain; uniform fl
 out vec4 o;
 float hash(vec2 p){ p = fract(p*vec2(123.34,456.21)); p += dot(p,p+45.32+uSeed); return fract(p.x*p.y); }
 void main(){
-  vec3 c = texture(uTex, vUv, uBias).rgb * vG;
+  vec4 t = texture(uTex, vUv, uBias); vec3 c = t.rgb * vG;
   float l = dot(c, vec3(0.299,0.587,0.114)); c = mix(vec3(l), c, uSat);
   c += (hash(gl_FragCoord.xy) - 0.5) * uGrain;
-  o = vec4(clamp(c,0.,1.), vA*uOpacity);
+  o = vec4(clamp(c,0.,1.), vA*uOpacity*t.a);
 }`;
 const VS_MASK = VS_FACE;
 const FS_MASK = `#version 300 es

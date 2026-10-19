@@ -5,6 +5,7 @@ import { fitSimilarity, applySim, smoothstep, sampleRGB, clamp, interpKeys, triA
 import { buildMotion } from './smoothing.js';
 import { blobToCanvas, buildProfileMesh, tinyCrop, faceBox, recolorCanvas } from './profile.js';
 import { getTask, segment } from './models.js';
+import { buildRig, deformRig, poseJoints } from './puppet.js';
 
 export const KEY_PROPS = ['x', 'y', 'scale', 'rot', 'opacity'];
 export const DEFAULT_ENTRY = () => ({
@@ -15,6 +16,7 @@ export const DEFAULT_ENTRY = () => ({
   top: { garmentId: null, width: 1.15, collar: 0.12, opacity: 1, clip: true },
   bottom: { garmentId: null, width: 1.25, opacity: 1, clip: true },
   recolor: { on: false, color: '#5b3fd6', strength: 0.75 },
+  body: { on: false, light: 0.6, opacity: 1 },
   transform: { x: 0, y: 0, scale: 1, rot: 0, opacity: 1 },
   keys: [], strokes: [], skip: [],
 });
@@ -23,7 +25,7 @@ export const outfitOn = e => (e.outfit ? !!e.outfit.on : true);
 const inRanges = (ranges, k) => (ranges || []).some(([a, b]) => k >= a && k <= b);
 
 /** Load everything a project's cast needs into memory. */
-export async function prepareRuntime(project, { profiles, wardrobe, analysis, motionParams }) {
+export async function prepareRuntime(project, { profiles, wardrobe, analysis, motionParams, plate = null, background = null }) {
   const plan = project.plan, W = plan.width, H = plan.height;
   const rt = { W, H, photo: !!plan.photo, entries: [], face: null, needsPerson: false, needsMulti: false, state: new Map(), warnings: [] };
   try { rt.face = new FaceRenderer(W, H); } catch (e) { rt.warnings.push(e.message); }
@@ -57,12 +59,28 @@ export async function prepareRuntime(project, { profiles, wardrobe, analysis, mo
       r[part] = { g, img, grid: garmentGrid(g, img.width, img.height, part) };
       if (e[part].clip) rt.needsPerson = true;
     }
-    if (e.recolor.on && outfitOn(e)) rt.needsMulti = true;
+    if (e.recolor.on && outfitOn(e) && !e.body?.on) rt.needsMulti = true;
+    if (e.body?.on && prof?.body?.ok && (prof.self || prof.consent) && rt.face) {
+      const cut = await blobToCanvas(prof.body.png, 4096);
+      r.rig = buildRig(prof.body.alpha, prof.body.w, prof.body.h, prof.body.joints);
+      r.rigTex = rt.face.texture(prof.id + ':body:' + (prof.updatedAt || 0), cut);
+      r.rigMean = prof.body.mean;
+      if (!plate && (project.stage?.mode || 'scene') === 'scene') rt.warnings.push('Full-body mode without a clean plate: the original actor can show around your body. Build or upload a clean plate in Editor → Body.');
+      rt.needsPerson = true;
+    } else if (e.body?.on) rt.warnings.push(`Full body is on for Actor ${e.trackId}, but ${prof ? prof.name + ' has no analyzed full-body photo' : 'no character is cast'}.`);
     rt.entries.push(r);
   }
   if (rt.needsPerson) try { rt.personTask = await getTask('selfie', 'VIDEO'); } catch (err) { rt.needsPerson = false; rt.warnings.push('Garment clipping off: ' + err.message); }
   if (rt.needsMulti) try { rt.multiTask = await getTask('multiclass', 'VIDEO'); } catch (err) { rt.needsMulti = false; rt.warnings.push('Clothing recolor off: ' + err.message); }
   rt.work = mk(W, H); rt.tmp = mk(W, H); rt.maskC = mk(W, H);
+  rt.stage = project.stage || { mode: 'scene' };
+  if (plate) { rt.plate = mk(W, H); rt.plate.getContext('2d').drawImage(await blobToCanvas(plate, 4096), 0, 0, W, H); }
+  if (rt.stage.mode === 'background') {
+    rt.bg = mk(W, H); const bctx = rt.bg.getContext('2d');
+    bctx.fillStyle = rt.stage.color || '#101014'; bctx.fillRect(0, 0, W, H);
+    if (background) { const img = await blobToCanvas(background, 4096), s = Math.max(W / img.width, H / img.height); bctx.drawImage(img, (W - img.width * s) / 2, (H - img.height * s) / 2, img.width * s, img.height * s); }
+    else if (rt.plate) bctx.drawImage(rt.plate, 0, 0);
+  }
   return rt;
 }
 const mk = (w, h) => { const c = document.createElement('canvas'); c.width = w; c.height = h; return c; };
@@ -241,18 +259,45 @@ export function composeFrame(rt, src, k, opts = {}) {
   ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over';
   ctx.drawImage(src, 0, 0, W, H);
   const active = opts.restoreAll ? [] : rt.entries.filter(r => r.e.enabled && !inRanges(r.e.skip, k) && (!opts.onlyEntry || r.e.id === opts.onlyEntry));
-  const stats = { faces: 0, garments: 0, hair: 0, recolor: 0 };
+  const stats = { faces: 0, garments: 0, hair: 0, recolor: 0, bodies: 0 };
   let personSeg = null, multiSeg = null;
-  const needP = active.some(r => (r.top && r.e.top.clip) || (r.bottom && r.e.bottom.clip)) && rt.personTask;
+  const bodyRs = active.filter(r => r.rig && r.e.body?.on);
+  const needP = (active.some(r => (r.top && r.e.top.clip) || (r.bottom && r.e.bottom.clip)) || (bodyRs.length && rt.plate && rt.stage.mode !== 'background')) && rt.personTask;
   const needM = active.some(r => r.e.recolor.on && outfitOn(r.e)) && rt.multiTask;
   if (needP) personSeg = segment(rt.personTask, src, 'VIDEO', [-1]);
   if (needM) multiSeg = segment(rt.multiTask, src, 'VIDEO', [4]);
+  // 0) stage: new background, or remove the original actor with the clean plate
+  if (!opts.restoreAll && rt.stage.mode === 'background' && rt.bg && bodyRs.length) ctx.drawImage(rt.bg, 0, 0);
+  else if (rt.plate && personSeg) for (const r of bodyRs) {
+    const bb = r.motion.bbox[k]; if (!bb) continue;
+    maskCanvasFrom(personSeg, W, H, rt.maskC, expandBox(bb, W, H, 0.2));
+    const mctx = rt.maskC.getContext('2d'); // dilate: re-stamp the mask at small offsets
+    const d = Math.max(2, Math.round(Math.min(W, H) * 0.012)); mctx.globalCompositeOperation = 'source-over';
+    const copy = mk(W, H); copy.getContext('2d').drawImage(rt.maskC, 0, 0);
+    for (const [dx, dy] of [[d, 0], [-d, 0], [0, d], [0, -d], [d, d], [-d, -d], [d, -d], [-d, d]]) mctx.drawImage(copy, dx, dy);
+    const tctx = rt.tmp.getContext('2d'); tctx.setTransform(1, 0, 0, 1, 0, 0); tctx.clearRect(0, 0, W, H); tctx.drawImage(rt.plate, 0, 0);
+    tctx.globalCompositeOperation = 'destination-in'; tctx.drawImage(rt.maskC, 0, 0); tctx.globalCompositeOperation = 'source-over';
+    ctx.drawImage(rt.tmp, 0, 0);
+  }
+  // 0b) full body (MotionLock Animate): your cut-out body skinned to the actor's pose
+  if (rt.face && bodyRs.length) {
+    const draws = [];
+    for (const r of bodyRs) {
+      const P = r.motion.pose[k]; if (!P) continue;
+      const pos = deformRig(r.rig, poseJoints(P, W, H));
+      const bb = r.motion.bbox[k], tiny = bb ? tinyCrop(src, expandBox(bb, W, H, 0), 4) : null;
+      let g = 1;
+      if (tiny) { let l = 0; for (let i = 0; i < tiny.data.length; i += 4) l += 0.299 * tiny.data[i] + 0.587 * tiny.data[i + 1] + 0.114 * tiny.data[i + 2]; l /= tiny.data.length / 4; const lr = 0.299 * r.rigMean[0] + 0.587 * r.rigMean[1] + 0.114 * r.rigMean[2]; g = clamp(1 + ((l + 6) / (lr + 6) - 1) * r.e.body.light, 0.55, 1.6); }
+      draws.push({ tex: r.rigTex, pos, uv: r.rig.uv, alpha: new Float32Array(r.rig.n).fill(1), gain: new Float32Array(r.rig.n * 3).fill(g), idx: r.rig.idx, opacity: r.e.body.opacity ?? 1, grain: r.e.face.grain, sat: 1, bias: 0.3 });
+    }
+    if (draws.length) { rt.face.render(out, draws); ctx.drawImage(rt.face.canvas, 0, 0); stats.bodies = draws.length; }
+  }
   // 1) body layers
   for (const r of active) {
     const P = r.motion.pose[k], bb = r.motion.bbox[k];
     if (!P || !bb) continue;
     const box = expandBox(bb, W, H, 0.12);
-    if (r.e.recolor.on && outfitOn(r.e) && multiSeg) { recolorClothes(ctx, multiSeg, box, r.e.recolor, W, H); stats.recolor++; }
+    if (r.e.recolor.on && outfitOn(r.e) && !r.rig && multiSeg) { recolorClothes(ctx, multiSeg, box, r.e.recolor, W, H); stats.recolor++; }
     for (const part of ['bottom', 'top']) {
       const G = r[part]; if (!G) continue;
       const map = garmentTarget(P, part, r.e[part], W, H); if (!map) continue;

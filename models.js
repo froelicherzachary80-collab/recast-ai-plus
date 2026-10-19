@@ -18,8 +18,9 @@ export const MODELS = [
 export const UNAVAILABLE_MODELS = [
   { name: 'Local inpainting (background reconstruction)', why: 'No inpainting model has been validated on Safari/iPhone for this build. Upload-a-clean-plate is also V0.2.' },
   { name: 'Garment generation from text', why: 'No local image-generation model is installed or validated on-device. The text field stays disabled.' },
-  { name: 'Video diffusion / photoreal full-body synthesis', why: 'Not runnable in mobile Safari at usable speed. Not claimed.' },
-  { name: 'Transformers.js / ONNX Runtime Web models', why: 'Not used by v0.1 — no ONNX model in this build needed them. Hook reserved for V0.2.' },
+  { name: 'Whisper speech-to-text (Transformers.js)', why: 'Used by Dub Studio. Downloads from Hugging Face the first time you tap Transcribe (tiny ≈ 40 MB, base ≈ 80 MB) and is cached by the browser. Not managed on this screen.', available: true },
+  { name: 'In-app voice cloning TTS (Pocket TTS, Chatterbox)', why: 'Browser builds exist but are unverified on iPhone Safari (Chatterbox is ~1.5 GB and marked Safari in-progress by its web port). For now: record your lines, or generate a cloned line in a local tool and import it per line.' },
+  { name: 'Wan 2.2 Animate–style diffusion video', why: 'Needs an ~80 GB-class data-center GPU. RECAST uses a pose-driven full-body rig instead.' },
 ];
 
 let visionMod = null, fileset = null, visionErr = null;
