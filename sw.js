@@ -1,9 +1,9 @@
 // RECAST AI+ service worker — offline app shell + cached runtime libraries (MediaPipe WASM, Mediabunny, fonts).
 // Personal media never passes through here: videos and photos are read from local files / IndexedDB only.
-const VERSION = 'recast-v0.2.0';
+const VERSION = 'recast-v0.3.0';
 const SHELL = ['./', 'index.html', 'styles.css', 'manifest.webmanifest', 'icon.svg', 'icon-180.png', 'icon-512.png',
   'app.js', 'ui.js', 'db.js', 'geometry.js', 'tracker.js', 'smoothing.js', 'facemesh.js', 'models.js',
-  'media.js', 'profile.js', 'facerender.js', 'compositor.js', 'analysis.js', 'render.js', 'caps.js', 'selftest.js', 'puppet.js', 'plate.js', 'dub.js'];
+  'media.js', 'profile.js', 'facerender.js', 'compositor.js', 'analysis.js', 'render.js', 'caps.js', 'selftest.js', 'puppet.js', 'plate.js', 'dub.js', 'poserig.js', 'posestudio.js'];
 const RUNTIME_HOSTS = ['cdn.jsdelivr.net', 'fonts.googleapis.com', 'fonts.gstatic.com'];
 
 self.addEventListener('install', e => {

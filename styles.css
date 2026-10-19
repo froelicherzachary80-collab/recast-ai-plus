@@ -141,8 +141,8 @@ table.tbl { border-collapse: collapse; width: 100%; font-size: 13px; }
 
 /* tab bar */
 .tabs { position: fixed; left: 0; right: 0; bottom: 0; z-index: 25; background: rgba(15, 13, 20, .96); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); border-top: 1px solid var(--line); padding-bottom: env(safe-area-inset-bottom, 0px); padding-left: env(safe-area-inset-left, 0px); padding-right: env(safe-area-inset-right, 0px); }
-.tabs nav { display: grid; grid-template-columns: repeat(5, 1fr); max-width: 640px; margin: 0 auto; height: var(--tab-h); }
-.tabs a { display: grid; place-items: center; align-content: center; gap: 3px; text-decoration: none; color: #8b859b; font: 600 10.5px var(--f-body); letter-spacing: .02em; }
+.tabs nav { display: grid; grid-template-columns: repeat(6, 1fr); max-width: 640px; margin: 0 auto; height: var(--tab-h); }
+.tabs a { display: grid; place-items: center; align-content: center; gap: 3px; text-decoration: none; color: #8b859b; font: 600 10px var(--f-body); min-width: 0; letter-spacing: .02em; }
 .tabs a svg { width: 22px; height: 22px; }
 .tabs a.on { color: var(--violet-hi); }
 

@@ -5,6 +5,15 @@ A local, private actor-replacement studio that runs entirely in the browser. Imp
 No server, no account, no paid API. All media stays in the browser's IndexedDB on your device.
 
 
+## What's new in v0.3 — Pose Studio
+Your full-body photo becomes a posable model (tab **Pose**):
+- **Pose by dragging** joints. Elbows and knees swing a limb, wrists and ankles bend it with two-bone IK, the neck leans the torso (hips stay planted), the head dot turns the head, the green dot moves the whole body. Bone lengths always stay yours. Size, mirror, reset, and a saved-poses library.
+- **Copy a pose from any photo** of a person.
+- **Dances:** keyframe your own (smooth or linear easing, looping), start from presets (Wave, Arms-up cheer, Side-step groove, Jumping jacks, Disco point, Robot), or **learn a dance from any video**: the dancer's pose is tracked frame by frame and retargeted onto your proportions. Learned dances can be converted to editable keyframes.
+- **Stage:** portrait, square or landscape; colour, photo or looping video background; soft ground shadow.
+- **Export:** PNG image of the current pose, or MP4 of the dance at 30 fps with your music or the dance video's original sound.
+- Limits: it is a 2D model of one photo. Side and back views, crossed limbs, hands and loose clothing do not change shape like a real body.
+
 ## What's new in v0.2
 - **Full-Body Animate** (new mode, experimental). Inspired by Wan Animate's character replacement, but running on your phone: the full-body photo in your character profile is cut out, meshed and rigged to 10 bones from your own pose, then driven every frame by the actor's tracked shoulders, elbows, wrists, hips, knees and ankles (linear blend skinning in WebGL). Your face replacement and hair sit on top.
   - **Keep the original scene:** a *clean plate* (built from frames where the background was visible, or uploaded) paints out the original actor before your body is drawn. Building works for tripod shots.
@@ -168,7 +177,7 @@ Status below is what the code does. **It has not yet been run in Safari on an iP
 
 | Area | Status |
 |---|---|
-| Pure logic (Delaunay, similarity fit, affine/bilinear maps, keyframes, tracker identity through occlusion, swap/merge, gap filling, One Euro, mesh build, frame selection/timing, presets, garment grid) | **34 Node unit tests, all passing** (incl. WSOLA, voice detection, take fitting, body rig, hole filling) (`npm test`). |
+| Pure logic (Delaunay, similarity fit, affine/bilinear maps, keyframes, tracker identity through occlusion, swap/merge, gap filling, One Euro, mesh build, frame selection/timing, presets, garment grid) | **43 Node unit tests, all passing** (incl. WSOLA, voice detection, take fitting, body rig, hole filling) (`npm test`). |
 | All modules | Parse-checked with Node; all cross-module imports resolve. |
 | Browser pipeline (storage, encode, decode + pixel check, WebGL warp, model start-up) | Implemented as in-app **self-tests** (Settings). **Not yet executed** — the build environment had no browser and no access to the CDN or model hosts. |
 | End-to-end on iPhone 16 Pro Safari | **Not yet executed.** Use the walkthrough in §4. The v0.1 acceptance criteria should be treated as unverified until that run passes. |

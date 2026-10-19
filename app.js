@@ -1,4 +1,4 @@
-// RECAST AI+ v0.2 — application shell and screens.
+// RECAST AI+ v0.3 — application shell and screens.
 import { h, $, toast, confirmBox, slider, check, seg, chip, progressBar, fileButton, timecode, downloadBlob, shareFile, icon } from './ui.js';
 import { db, uid, storageInfo, requestPersist } from './db.js';
 import { MODELS, UNAVAILABLE_MODELS, modelStatus, downloadModel, importModel, deleteModel, hasModel, getTask, runtime as mpRuntime, loadVision, disposeAll } from './models.js';
@@ -12,6 +12,7 @@ import { SLOTS, VIDEO_SLOTS, analyzeReference, missingViews, extractHair, newPro
 import { renderProject } from './render.js';
 import { analyzeBody, buildCleanPlate } from './plate.js';
 import * as Dub from './dub.js';
+import { poseStudio } from './posestudio.js';
 import { capabilityTest, fmtBytes } from './caps.js';
 import { runSelfTests } from './selftest.js';
 
@@ -106,7 +107,7 @@ function setTop(title, back) {
     S.job ? h('a', { class: 'chip v', href: '#/queue' }, `Rendering ${Math.round((S.job.progress || 0) * 100)}%`) : null);
 }
 function setTabs(active) {
-  const tabs = [['home', '#/', 'Studio'], ['cast', '#/library', 'Characters'], ['shirt', '#/wardrobe', 'Wardrobe'], ['chip', '#/models', 'Models'], ['gear', '#/settings', 'Settings']];
+  const tabs = [['home', '#/', 'Studio'], ['cast', '#/library', 'Characters'], ['pose', '#/pose', 'Pose'], ['shirt', '#/wardrobe', 'Wardrobe'], ['chip', '#/models', 'Models'], ['gear', '#/settings', 'Settings']];
   $('#tabs').replaceChildren(...tabs.map(([ic, href, label]) => h('a', { href, class: active === href ? 'on' : '' }, icon(ic), label)));
 }
 function steps(pid, cur) {
@@ -130,6 +131,7 @@ async function route() {
     [/^#\/character\/([^/]+)$/, m => characterBuilder(m[1]), '#/library'],
     [/^#\/wardrobe(?:\/([^/]+))?$/, m => wardrobeStudio(m[1]), '#/wardrobe'],
     [/^#\/queue$/, () => renderQueue(), '#/'],
+    [/^#\/pose(?:\/([^/]+))?$/, async m => { await reloadLibrary(); return poseStudio({ profiles: S.profiles, profileId: m[1], setTop, go: href => (location.hash = href), onCleanup: fn => S.cleanup.push(fn) }); }, '#/pose'],
     [/^#\/models$/, () => modelManager(), '#/models'],
     [/^#\/settings$/, () => settingsScreen(), '#/settings'],
   ];
@@ -168,12 +170,13 @@ async function dashboard() {
         } }, 'Delete'))));
   }
   return [
-    h('div', { class: 'hero-slate' }, h('span', { class: 'eyebrow' }, 'Private · on-device · v0.2'), h('h1', null, 'Put yourself in the scene, or on the poster.')),
+    h('div', { class: 'hero-slate' }, h('span', { class: 'eyebrow' }, 'Private · on-device · v0.3'), h('h1', null, 'Put yourself in the scene, or on the poster.')),
     h('a', { class: 'create', href: '#/new' }, h('span', { class: 'plus' }, '+ CREATE NEW RECAST'), h('span', { class: 'muted small' }, 'Video scene or photo poster → actor → your photos → export')),
     missing.length ? callout(h('span', null, 'Install the required models first: ', missing.map(m => m.name).join(', '), '. ', h('a', { href: '#/models' }, 'Open Model Manager')), 'warn') : null,
     panel(h('div', { class: 'row between' }, h('h2', null, 'Projects'), h('div', { class: 'row' }, fileButton('Import project', '.json,application/json', importProjectFile, { cls: 'btn sm ghost' }), h('a', { class: 'btn sm ghost', href: '#/queue' }, 'Render queue'))), list),
     h('div', { class: 'grid2' },
       panel(h('h3', null, 'Characters'), h('p', { class: 'muted small' }, `${S.profiles.length} saved locally. Start with “Myself”.`), h('a', { class: 'btn sm', href: '#/library' }, 'Character Library')),
+      panel(h('h3', null, 'Pose Studio'), h('p', { class: 'muted small' }, 'Turn your full-body photo into a posable model: drag joints, make dances, learn moves from any video, export images and videos.'), h('a', { class: 'btn sm', href: '#/pose' }, 'Open Pose Studio')),
       panel(h('h3', null, 'This device'), h('p', { class: 'muted small' }, 'Check WebGPU, codecs, storage and model start-up before your first render.'), h('a', { class: 'btn sm', href: '#/settings' }, 'Run capability test'))),
   ];
 }
@@ -1155,7 +1158,7 @@ async function characterBuilder(id) {
             await save(); draw();
           }, { cls: 'btn sm' }),
           r ? h('button', { class: 'btn sm ghost danger', onclick: async () => { delete pr.refs[s.key]; if (s.key === 'body') pr.body = null; await save(); draw(); } }, 'Delete') : null),
-          s.key === 'body' && r ? (pr.body?.ok ? h('div', { class: 'stack', style: { gap: '4px' } }, chip('rigged for Animate', 'ok'), pr.body.issues?.length ? h('p', { class: 'small', style: { color: 'var(--warn)' } }, pr.body.issues.join(' ')) : null)
+          s.key === 'body' && r ? (pr.body?.ok ? h('div', { class: 'stack', style: { gap: '4px' } }, h('div', { class: 'row' }, chip('rigged', 'ok'), h('a', { class: 'btn sm', href: `#/pose/${pr.id}` }, 'Pose Studio')), pr.body.issues?.length ? h('p', { class: 'small', style: { color: 'var(--warn)' } }, pr.body.issues.join(' ')) : null)
             : h('button', { class: 'btn sm', onclick: async () => { try { pr.body = await analyzeBody(r.blob, blobToCanvas); await save(); draw(); } catch (e) { toast(e.message, true, 7000); } } }, 'Rig body')) : null);
     }));
     const needsAnalysis = ['front', 'left', 'right'].filter(k => pr.refs[k] && !pr.refs[k].analysis);
@@ -1351,7 +1354,7 @@ async function settingsScreen() {
       h('div', { class: 'row' }, h('button', { class: 'btn', onclick: async () => toast((await requestPersist()) ? 'Persistent storage granted' : 'Safari declined. Adding to Home Screen improves retention.') }, 'Request persistent storage'),
         h('button', { class: 'btn danger', onclick: async () => { if (!(await confirmBox('Delete all RECAST data?', 'Projects, characters, wardrobe, models and exports on this device will be erased.', 'Erase everything'))) return; disposeAll(); await db.wipe(); S.project = null; S.file = null; await reloadLibrary(); toast('All data erased'); location.hash = '#/'; } }, 'Delete all data'))),
     panel(h('h2', null, 'About & licenses'),
-      h('p', { class: 'small' }, 'RECAST AI+ v0.2 · private, local, static web app.'),
+      h('p', { class: 'small' }, 'RECAST AI+ v0.3 · private, local, static web app.'),
       h('ul', { class: 'small muted' },
         h('li', null, 'MediaPipe Tasks Vision (Google) — Apache-2.0. Pose, Face, Hand Landmarker and Image Segmenter models: Apache-2.0, see each model card.'),
         h('li', null, 'Mediabunny (Vanilagy) — MPL-2.0. MP4/MOV demuxing, decoding and encoding via WebCodecs.'),
