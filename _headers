@@ -1,0 +1,5 @@
+# Cloudflare Pages / Netlify: cross-origin isolation lets the AI stem separator use several CPU threads.
+# (GitHub Pages cannot send headers; the separator then runs single-threaded, which is slower but works.)
+/*
+  Cross-Origin-Opener-Policy: same-origin
+  Cross-Origin-Embedder-Policy: require-corp

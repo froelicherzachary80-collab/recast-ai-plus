@@ -1,4 +1,4 @@
-// RECAST AI+ v0.5 — application shell and screens.
+// RECAST AI+ v0.6 — application shell and screens.
 import { h, $, toast, confirmBox, slider, check, seg, chip, progressBar, fileButton, timecode, downloadBlob, shareFile, icon } from './ui.js';
 import { db, uid, storageInfo, requestPersist } from './db.js';
 import { MODELS, UNAVAILABLE_MODELS, modelStatus, downloadModel, importModel, deleteModel, hasModel, getTask, runtime as mpRuntime, loadVision, disposeAll } from './models.js';
@@ -16,6 +16,9 @@ import * as Dub from './dub.js';
 import { poseStudio } from './posestudio.js';
 import { editStudio } from './editstudio.js';
 import { makeTPoseModel } from './tpose.js';
+import { generateAllViews } from './views.js';
+import { separateScene, buildStemTracks, mixStems, DEMUCS_MODEL } from './stems.js';
+import { mouthCurve, mouthActivity } from './lipsync.js';
 import { FaceRenderer } from './facerender.js';
 import { capabilityTest, fmtBytes } from './caps.js';
 import { runSelfTests } from './selftest.js';
@@ -92,10 +95,12 @@ async function getRuntime() {
     prof: p.cast.map(e => { const pr = S.profiles.find(x => x.id === e.profileId); return pr ? [pr.updatedAt || pr.createdAt, pr.consent ? 1 : 0] : 0; }),
     ward: S.wardrobe.map(w => [w.id, w.updatedAt || w.createdAt]), m: motionParams(), a: p.analysis?.at,
     body: p.cast.map(e => e.body?.on), stage: p.stage, plate: p.plateAt, bg: p.bgAt,
+    lips: (p.dub?.lines || []).filter(l => l.lipsync && l.take).map(l => [l.id, l.take.at, l.start, l.end, l.natural, l.speaker, l.enabled]),
   });
   if (S.rt && S.rtKey === key) return S.rt;
   dropRuntime();
-  S.rt = await prepareRuntime(p, { profiles: S.profiles, wardrobe: S.wardrobe, analysis: p.analysis, motionParams: motionParams(), ...(await stageAssets(p)) });
+  let lips = null; try { lips = await computeLips(p); } catch (e) { toast('Lip-sync skipped: ' + e.message, true); }
+  S.rt = await prepareRuntime(p, { profiles: S.profiles, wardrobe: S.wardrobe, analysis: p.analysis, motionParams: motionParams(), lips, ...(await stageAssets(p)) });
   S.rtKey = key;
   return S.rt;
 }
@@ -175,7 +180,11 @@ async function dashboard() {
         } }, 'Delete'))));
   }
   return [
-    h('div', { class: 'hero-slate' }, h('span', { class: 'eyebrow' }, 'Private · on-device · v0.5'), h('h1', null, 'Put yourself in the scene, or on the poster.')),
+    h('div', { class: 'hero-slate' }, h('span', { class: 'eyebrow' }, 'Private · on-device · v0.6'), h('h1', null, 'Put yourself in the scene, or on the poster.')),
+    h('button', { class: 'btn block', style: { minHeight: '52px' }, onclick: async () => {
+      const id = uid('r'), p = { id, name: 'TikTok edit ' + new Date().toLocaleDateString(undefined, { month: 'short', day: 'numeric' }), kind: 'edit', mode: 'face', preset: 'quality', createdAt: Date.now(), updatedAt: Date.now(), cast: [], selected: [], restore: [], defaults: { hair: false, outfit: false, body: false }, stage: { mode: 'scene', color: '#101014' }, motion: { minCutoff: 1.2, beta: 0.02, maxGap: 6 } };
+      await db.put('projects', p); S.project = p; S.file = null; S.grabber = null; dropRuntime(); location.hash = `#/p/${id}/import`;
+    } }, '⬆ Upload an edit (TikTok, Reels)'),
     h('a', { class: 'create', href: '#/new' }, h('span', { class: 'plus' }, '+ CREATE NEW RECAST'), h('span', { class: 'muted small' }, 'Video scene or photo poster → actor → your photos → export')),
     missing.length ? callout(h('span', null, 'Install the required models first: ', missing.map(m => m.name).join(', '), '. ', h('a', { href: '#/models' }, 'Open Model Manager')), 'warn') : null,
     panel(h('div', { class: 'row between' }, h('h2', null, 'Projects'), h('div', { class: 'row' }, fileButton('Import project', '.json,application/json', importProjectFile, { cls: 'btn sm ghost' }), h('a', { class: 'btn sm ghost', href: '#/queue' }, 'Render queue'))), list),
@@ -271,6 +280,7 @@ async function importScreen(p) {
       h('span', { class: 'btn primary' }, 'Choose video or photo'),
       h('input', { type: 'file', accept: 'video/mp4,video/quicktime,video/*,image/*', 'aria-label': 'Choose video or photo', style: { position: 'absolute', inset: '0', opacity: '0', width: '100%', cursor: 'pointer' }, onchange: e => pick(e.target.files[0]) }));
     parts.push(drop);
+    if (p.kind === 'edit') parts.push(callout(h('span', null, h('b', null, 'Edit workflow: '), 'upload the edit → Actors finds every cut and groups the same person across shots → Cast picks who becomes who → Dub separates voices, song vocals and music, then you record new lines (same or new words, with lip-sync) → Render.')));
     parts.push(h('p', { class: 'muted small' }, 'Only recast footage you have the right to edit, and only with the consent of anyone whose likeness you add.'));
     if (p.meta && S.file && p.meta.kind === 'photo') {
       const m = p.meta, url = URL.createObjectURL(S.file); S.cleanup.push(() => URL.revokeObjectURL(url));
@@ -825,7 +835,7 @@ async function sceneAudio(p) {
   return dubCache.scene;
 }
 async function fittedLine(p, l, scene) {
-  const ck = l.id + ':' + l.take.at + ':' + l.start + ':' + l.end;
+  const ck = l.id + ':' + l.take.at + ':' + l.start + ':' + l.end + ':' + !!l.natural;
   if (dubCache.fits.has(ck)) return dubCache.fits.get(ck);
   const rec = await db.get('renders', `take:${p.id}:${l.id}`);
   if (!rec?.blob) throw new Error('Recording for a line is missing. Record it again.');
@@ -833,15 +843,51 @@ async function fittedLine(p, l, scene) {
   const mono = await Dub.resample(Dub.toMono([...Array(buf.numberOfChannels).keys()].map(c => buf.getChannelData(c))), buf.sampleRate, scene.sampleRate);
   const sr = scene.sampleRate, a = Math.floor(l.start * sr), b = Math.min(scene.length, Math.ceil(l.end * sr));
   const orig = Dub.toMono([...Array(scene.numberOfChannels).keys()].map(c => scene.getChannelData(c).subarray(a, b)));
-  const fit = Dub.fitTake(mono, sr, l.end - l.start, Math.max(0.05, Dub.rms(orig) * 0.95));
+  const fit = Dub.fitTake(mono, sr, l.end - l.start, Math.max(0.05, Dub.rms(orig) * 0.95), l.natural ? { maxStretch: 1, minStretch: 1 } : {});
+  if (l.natural) fit.warn = null; // new words keep your own timing; the mouth follows the take
   dubCache.fits.set(ck, fit);
   return fit;
 }
 async function buildDubMix(p) {
   if (!S.file) await openProject(p.id);
   const scene = await sceneAudio(p), lines = [];
-  for (const l of p.dub.lines) if (l.take && l.enabled !== false) { const f = await fittedLine(p, l, scene); lines.push({ start: l.start, end: l.end, fit: f.samples, gain: l.gain ?? 1 }); }
+  for (const l of p.dub.lines) if (l.take && l.enabled !== false) { const f = await fittedLine(p, l, scene); lines.push({ start: l.start, end: Math.max(l.end, l.start + f.samples.length / scene.sampleRate), fit: f.samples, sr: scene.sampleRate, gain: l.gain ?? 1 }); }
+  const st = p.dub.useStems !== false ? await loadStems(p) : null;
+  if (st) { const v = p.dub.stemVol || {}; return mixStems(buildStemTracks(st.sep), st.sep.sr, lines, { voiceVol: v.voice ?? 1, singVol: v.sing ?? 1, musicVol: v.music ?? 1, newVol: p.dub.voiceGain ?? 1 }); }
   return Dub.mixDub(scene, lines, p.dub);
+}
+
+// ───────── stems (character voices · song vocals · music) ─────────
+async function loadStems(p) {
+  const rec = await db.get('renders', 'stems:' + p.id); if (!rec) return null;
+  if (dubCache.stemsAt === rec.at && dubCache.stems) return dubCache.stems;
+  const v = await Dub.decodeBlob(rec.vocals), m = await Dub.decodeBlob(rec.music), ch = (b, c) => b.getChannelData(Math.min(c, b.numberOfChannels - 1));
+  const sep = { sr: v.sampleRate, vocals: { left: ch(v, 0), right: ch(v, 1) }, music: { left: ch(m, 0), right: ch(m, 1) }, segs: rec.segs };
+  dubCache.stemsAt = rec.at; dubCache.stems = { rec, sep }; return dubCache.stems;
+}
+async function saveStems(p, sep) {
+  const rec = { id: 'stems:' + p.id, vocals: Dub.encodeWav([sep.vocals.left, sep.vocals.right], sep.sr), music: Dub.encodeWav([sep.music.left, sep.music.right], sep.sr), sr: sep.sr, engine: sep.engine, segs: sep.segs, at: Date.now() };
+  await db.put('renders', rec); dubCache.stems = null; return rec;
+}
+/** Per-track, per-frame mouth parameters for lip-synced lines. */
+async function computeLips(p) {
+  const d = p.dub; if (!d?.lines?.some(l => l.take && l.lipsync && l.enabled !== false) || !p.analysis) return null;
+  const scene = await sceneAudio(p), sr = scene.sampleRate, fps = p.plan.fps, lips = new Map();
+  const ppl = peopleOf(p).filter(g => g.tracks.some(t => p.selected.includes(t)));
+  for (const l of d.lines) {
+    if (!l.take || !l.lipsync || l.enabled === false) continue;
+    const f = await fittedLine(p, l, scene), curve = mouthCurve(f.samples, sr, fps);
+    const k0 = Math.round(l.start * fps), kEnd = Math.min(p.plan.frames, Math.max(k0 + curve.open.length, Math.round(l.end * fps)));
+    let g = ppl.find(x => x.id === l.speaker);
+    if (!g) { let best = 0; for (const x of ppl) { const a = Math.max(0, ...x.tracks.map(t => mouthActivity(p.analysis.frames, t, k0, kEnd))); if (a > best) { best = a; g = x; } } }
+    g = g || ppl[0]; if (!g) continue;
+    for (const t of g.tracks) {
+      const m = lips.get(t) || new Map();
+      for (let k = k0; k < kEnd; k++) { const i = k - k0; m.set(k, i < curve.open.length ? { open: curve.open[i], wide: curve.wide[i], neutral: 1 } : { open: 0, wide: 0, neutral: 1 }); }
+      lips.set(t, m);
+    }
+  }
+  return lips;
 }
 let playing = null;
 function stopPlayback() { try { playing?.src.stop(); } catch {} try { playing?.video?.pause(); } catch {} playing = null; }
@@ -865,13 +911,15 @@ async function dubScreen(p) {
   const find = async (how) => {
     try {
       status.textContent = 'Reading scene audio…';
-      const scene = await sceneAudio(p);
-      const mono = Dub.toMono([...Array(scene.numberOfChannels).keys()].map(c => scene.getChannelData(c)));
+      const scene = await sceneAudio(p), st = d.useStems !== false ? await loadStems(p) : null;
+      // with stems, only the character voices are searched: song vocals and music are ignored
+      let mono, sr;
+      if (st) { const v = buildStemTracks(st.sep).voice; mono = Dub.toMono(v); sr = st.sep.sr; } else { mono = Dub.toMono([...Array(scene.numberOfChannels).keys()].map(c => scene.getChannelData(c))); sr = scene.sampleRate; }
       let found;
-      if (how === 'whisper') found = await Dub.transcribe(await Dub.resample(mono, scene.sampleRate, 16000), { model: d.model, onStatus: t => (status.textContent = t) });
-      else found = Dub.detectVoice(mono, scene.sampleRate).map(v => ({ ...v, text: '' }));
+      if (how === 'whisper') found = await Dub.transcribe(await Dub.resample(mono, sr, 16000), { model: d.model, onStatus: t => (status.textContent = t) });
+      else found = Dub.detectVoice(mono, sr).map(v => ({ ...v, text: '' }));
       const dur = p.plan.end - p.plan.start;
-      d.lines = found.filter(f => f.end > f.start && f.start < dur).map(f => ({ id: uid('l'), start: +Math.max(0, f.start).toFixed(3), end: +Math.min(dur, f.end).toFixed(3), text: f.text || '', enabled: true }));
+      d.lines = found.filter(f => f.end > f.start && f.start < dur).map(f => ({ id: uid('l'), start: +Math.max(0, f.start).toFixed(3), end: +Math.min(dur, f.end).toFixed(3), text: f.text || '', origText: f.text || '', enabled: true }));
       saveProject(); status.textContent = `${d.lines.length} line(s) found.`; draw();
     } catch (e) { console.error(e); status.textContent = ''; toast((how === 'whisper' ? 'Transcription failed: ' : 'Detection failed: ') + e.message, true, 8000); }
   };
@@ -892,7 +940,7 @@ async function dubScreen(p) {
       try {
         await db.put('renders', { id: `take:${p.id}:${l.id}`, blob, at: Date.now() });
         l.take = { at: Date.now(), source: 'mic' };
-        const f = await fittedLine(p, l, await sceneAudio(p)); l.take.stretch = f.stretch; l.take.warn = f.warn; saveProject();
+        const f = await fittedLine(p, l, await sceneAudio(p)); l.take.stretch = f.stretch; l.take.warn = f.warn; l.take.rawDur = f.rawDur; dropRuntime(); saveProject();
         msg.textContent = f.warn || `Fitted: ${f.rawDur.toFixed(2)} s → ${lineDur(l)} s (×${f.stretch.toFixed(2)})`;
         const sr = (await sceneAudio(p)).sampleRate, b = Dub.audioCtx().createBuffer(1, f.samples.length, sr); b.copyToChannel(f.samples, 0);
         result.replaceChildren(h('div', { class: 'row' }, h('button', { class: 'btn sm', onclick: () => playBuffer(b, 0, undefined, video, p.plan.start + l.start) }, '▶ Hear take with picture'), h('button', { class: 'btn sm', onclick: close }, 'Use take')));
@@ -907,10 +955,62 @@ async function dubScreen(p) {
       result));
     document.body.appendChild(m);
   };
-  const draw = () => {
+  const speakers = p.analysis ? peopleOf(p).filter(g => g.tracks.some(t => p.selected.includes(t))) : [];
+  const stemsBox = h('div', { class: 'stack' });
+  const stemPlay = async which => {
+    const st = await loadStems(p); if (!st) return; const tr = buildStemTracks(st.sep)[which], b = Dub.audioCtx().createBuffer(2, tr[0].length, st.sep.sr);
+    b.copyToChannel(tr[0], 0); b.copyToChannel(tr[1], 1); playBuffer(b, 0, undefined, video, p.plan.start);
+  };
+  const drawStems = async () => {
+    const st = await loadStems(p), installed = !!(await db.get('models', DEMUCS_MODEL.key));
+    d.stemEngine = d.stemEngine || (installed ? 'ai' : 'basic'); d.stemVol = d.stemVol || { voice: 1, sing: 1, music: 1 };
+    const bar = progressBar(), msg = h('p', { class: 'small muted mono' }); bar.hidden = true;
+    const run = async btn => {
+      btn.disabled = true; bar.hidden = false;
+      try {
+        const sep = await separateScene(await sceneAudio(p), d.stemEngine, { onStatus: t => (msg.textContent = t), onProgress: v => bar.set(v) });
+        await saveStems(p, sep); d.useStems = true; saveProject(); toast(`Separated with ${sep.engine === 'htdemucs' ? 'HTDemucs' : 'the basic engine'}: ${sep.segs.filter(x => x.kind === 'voice').length} voice part(s), ${sep.segs.filter(x => x.kind === 'singing').length} sung part(s)`);
+      } catch (e) { console.error(e); toast('Separation failed: ' + e.message, true, 8000); }
+      drawStems();
+    };
+    if (!st) { stemsBox.replaceChildren(panel(h('h2', null, 'Separate the sound'),
+      h('p', { class: 'muted small' }, 'Splits the clip into character voices, song vocals and music, so your voice replaces the original actor cleanly and the song keeps playing underneath.'),
+      seg([['ai', installed ? 'AI · HTDemucs' : 'AI · HTDemucs (install)'], ['basic', 'Basic · no download']], d.stemEngine, v => { d.stemEngine = v; saveProject(); drawStems(); }),
+      d.stemEngine === 'ai' && !installed ? callout(h('span', null, 'The AI separator is a one-time ≈172 MB download, kept on this device. ', h('a', { href: '#/models' }, 'Install it in Models')), 'warn') : null,
+      d.stemEngine === 'basic' ? h('p', { class: 'small muted' }, 'Basic keeps centre-panned voices and removes them from the music. Fast, but voices and instruments bleed into each other.') : null,
+      h('button', { class: 'btn primary', disabled: !p.meta.audio.length || (d.stemEngine === 'ai' && !installed), onclick: ev => run(ev.target) }, 'Separate stems'), bar, msg)); return; }
+    const segs = st.rec.segs;
+    stemsBox.replaceChildren(panel(
+      h('div', { class: 'row between' }, h('h2', null, 'Stems'), chip(st.rec.engine === 'htdemucs' ? 'AI · HTDemucs' : 'Basic', st.rec.engine === 'htdemucs' ? 'ok' : 'warn')),
+      check('Use stems in the mix (your voice fully replaces the original voice)', d.useStems !== false, v => { d.useStems = v; saveProject(); }),
+      h('div', { class: 'row' }, h('button', { class: 'btn sm', onclick: () => stemPlay('voice') }, '▶ Character voices'), h('button', { class: 'btn sm', onclick: () => stemPlay('singing') }, '▶ Song vocals'), h('button', { class: 'btn sm', onclick: () => stemPlay('music') }, '▶ Music'), h('button', { class: 'btn sm', onclick: stopPlayback }, 'Stop')),
+      slider('Character voices', d.stemVol.voice, { min: 0, max: 1.5, step: 0.05, oninput: v => { d.stemVol.voice = v; saveProject(); } }),
+      slider('Song vocals', d.stemVol.sing, { min: 0, max: 1.5, step: 0.05, oninput: v => { d.stemVol.sing = v; saveProject(); } }),
+      slider('Music', d.stemVol.music, { min: 0, max: 1.5, step: 0.05, oninput: v => { d.stemVol.music = v; saveProject(); } }),
+      h('h3', null, `Vocal parts · ${segs.length}`), h('p', { class: 'muted small' }, 'Each vocal part is labelled speech or singing from its pitch (sung notes hold steady). Tap a label to flip it.'),
+      h('div', { class: 'stack', style: { gap: '6px' } }, segs.map(sg => h('div', { class: 'row' },
+        h('span', { class: 'mono small', style: { minWidth: '108px' } }, `${sg.start.toFixed(2)}–${sg.end.toFixed(2)} s`),
+        h('span', { class: 'chip toggle-chip', role: 'button', tabindex: 0, 'aria-pressed': String(sg.kind === 'voice'), onclick: async () => { sg.kind = sg.kind === 'voice' ? 'singing' : 'voice'; st.rec.segs = segs; await db.put('renders', st.rec); dubCache.stems = null; drawStems(); } }, sg.kind === 'voice' ? 'character voice' : 'song vocal'),
+        sg.auto !== sg.kind ? chip('edited') : null,
+        h('button', { class: 'btn sm ghost', onclick: async () => { const s2 = await loadStems(p), b = Dub.audioCtx().createBuffer(2, s2.sep.vocals.left.length, s2.sep.sr); b.copyToChannel(s2.sep.vocals.left, 0); b.copyToChannel(s2.sep.vocals.right, 1); playBuffer(b, sg.start, sg.end - sg.start, video, p.plan.start + sg.start); } }, '▶')))),
+      h('div', { class: 'row' },
+        h('button', { class: 'btn sm', onclick: () => { d.lines = segs.filter(x => x.kind === 'voice').map(x => ({ id: uid('l'), start: +x.start.toFixed(3), end: +x.end.toFixed(3), text: '', origText: '', enabled: true })); saveProject(); draw(); toast(`${d.lines.length} line(s) from the character voices`); } }, 'Make lines from voice parts'),
+        ...['voice', 'singing', 'music'].map(k => h('button', { class: 'btn sm ghost', onclick: async () => { const s2 = await loadStems(p), tr = buildStemTracks(s2.sep)[k]; downloadBlob(Dub.encodeWav(tr, s2.sep.sr), `${p.name.replace(/[^\w-]+/g, '_')}_${k}.wav`); } }, `⤓ ${k === 'voice' ? 'voices' : k === 'singing' ? 'song vocals' : 'music'}.wav`)),
+        h('button', { class: 'btn sm ghost danger', onclick: async () => { await db.del('renders', 'stems:' + p.id); dubCache.stems = null; d.useStems = false; saveProject(); drawStems(); } }, 'Delete stems'))));
+  };
+  drawStems();
+  // deferred redraw: a text box losing focus fires "change" while the list is being replaced
+  let drawT = 0; const draw = () => { clearTimeout(drawT); drawT = setTimeout(drawNow, 0); };
+  const drawNow = () => {
     const rows = d.lines.map((l, i) => h('div', { class: 'panel', style: { gap: '8px', borderColor: l.take ? 'rgba(79,209,161,.45)' : '' } },
       h('div', { class: 'row between' }, h('span', { class: 'mono small' }, `#${i + 1} · ${l.start.toFixed(2)}–${l.end.toFixed(2)} s (${lineDur(l)} s)`), h('div', { class: 'row' }, l.take ? chip(l.take.source === 'import' ? 'imported' : 'recorded', 'ok') : chip('original voice'), check('Use', l.enabled !== false, v => { l.enabled = v; saveProject(); })) ),
-      h('textarea', { rows: 2, placeholder: 'Line text (for the teleprompter)', value: l.text, oninput: e => { l.text = e.target.value; saveProject(); } }),
+      h('textarea', { rows: 2, placeholder: 'Line text: keep the original words, or write new ones', value: l.text, oninput: e => { l.text = e.target.value; if (!l.optsSet && (l.origText ?? '') !== '' && l.text.trim() !== l.origText.trim()) { l.lipsync = true; l.natural = true; } saveProject(); }, onchange: () => draw() }),
+      l.origText && l.text.trim() !== l.origText.trim() ? h('p', { class: 'small muted' }, 'Original: “', l.origText, '”') : null,
+      h('div', { class: 'row' },
+        check('New words: keep my own timing', !!l.natural, v => { l.natural = v; l.optsSet = true; saveProject(); draw(); }),
+        check('Lip-sync the mouth to my take', !!l.lipsync, v => { l.lipsync = v; l.optsSet = true; saveProject(); dropRuntime(); draw(); }),
+        speakers.length > 1 ? h('select', { 'aria-label': 'Who says this line', style: { width: 'auto' }, onchange: e => { l.speaker = e.target.value || null; saveProject(); dropRuntime(); } }, h('option', { value: '' }, 'Speaker: auto (moving mouth)'), speakers.map(g => h('option', { value: g.id, selected: g.id === l.speaker }, g.name))) : null),
+      l.natural && l.take && (() => { const nxt = d.lines[i + 1], end = l.start + (l.take.rawDur || 0); return nxt && end > nxt.start ? h('p', { class: 'small', style: { color: 'var(--warn)' } }, `Your take runs into line #${i + 2}. Shorten it or move that line.`) : null; })(),
       h('div', { class: 'row' },
         h('label', { class: 'small muted row' }, 'Start', h('input', { type: 'number', step: 0.05, value: l.start, style: { width: '86px' }, onchange: e => { l.start = Math.max(0, +e.target.value); saveProject(); draw(); } })),
         h('label', { class: 'small muted row' }, 'End', h('input', { type: 'number', step: 0.05, value: l.end, style: { width: '86px' }, onchange: e => { l.end = Math.max(l.start + 0.2, +e.target.value); saveProject(); draw(); } }))),
@@ -921,7 +1021,7 @@ async function dubScreen(p) {
         fileButton('Import audio', 'audio/*,video/*', async f => {
           if (!consentOk()) { toast('Choose a voice character with consent first.', true); return; }
           await db.put('renders', { id: `take:${p.id}:${l.id}`, blob: f, at: Date.now() }); l.take = { at: Date.now(), source: 'import' };
-          try { const fit = await fittedLine(p, l, await sceneAudio(p)); l.take.stretch = fit.stretch; l.take.warn = fit.warn; } catch (e) { toast(e.message, true); }
+          try { const fit = await fittedLine(p, l, await sceneAudio(p)); l.take.stretch = fit.stretch; l.take.warn = fit.warn; l.take.rawDur = fit.rawDur; dropRuntime(); } catch (e) { toast(e.message, true); }
           saveProject(); draw();
         }, { cls: 'btn sm' }),
         l.take ? h('button', { class: 'btn sm', onclick: async () => { const sc = await sceneAudio(p), f = await fittedLine(p, l, sc), b = Dub.audioCtx().createBuffer(1, f.samples.length, sc.sampleRate); b.copyToChannel(f.samples, 0); playBuffer(b, 0, undefined, video, p.plan.start + l.start); } }, '▶ Take') : null,
@@ -942,6 +1042,7 @@ async function dubScreen(p) {
           h('button', { class: 'btn ghost', onclick: () => { const t = Math.max(0, (video.currentTime || p.plan.start) - p.plan.start); d.lines.push({ id: uid('l'), start: +t.toFixed(2), end: +Math.min(p.plan.end - p.plan.start, t + 2).toFixed(2), text: '', enabled: true }); d.lines.sort((a, b) => a.start - b.start); saveProject(); draw(); } }, '+ Line at playhead')),
         status,
         h('p', { class: 'muted small' }, 'Whisper downloads from Hugging Face once, then runs on this device. The audio never leaves the phone.')),
+      stemsBox,
       d.lines.length ? h('div', { class: 'stack' }, h('div', { class: 'row between' }, h('h2', null, `Lines · ${done}/${d.lines.length} dubbed`)), rows) : null,
       panel(h('h2', null, 'Mix'),
         h('label', { class: 'f' }, 'Original voice during dubbed lines', seg([['duck', 'Lower it'], ['mute', 'Mute it'], ['center', 'Remove centre voice (stereo)']], d.mode, v => { d.mode = v; saveProject(); draw(); })),
@@ -950,15 +1051,15 @@ async function dubScreen(p) {
         slider('Room / reverb', d.room, { min: 0, max: 0.8, step: 0.01, oninput: v => { d.room = v; saveProject(); } }),
         slider('Match scene tone', d.tone, { min: 0, max: 0.8, step: 0.01, oninput: v => { d.tone = v; saveProject(); } }),
         slider('Voice level', d.voiceGain, { min: 0.3, max: 2, step: 0.05, oninput: v => { d.voiceGain = v; saveProject(); } }),
-        h('p', { class: 'muted small' }, 'Music and effects under a dubbed line are lowered with the voice unless you use centre removal. A dedicated voice/music separation model is on the roadmap.'),
+        h('p', { class: 'muted small' }, 'With stems, the original voice is removed only where you dubbed and the music keeps playing. Without stems, music under a dubbed line is lowered with the voice.'),
         h('div', { class: 'row' },
           h('button', { class: 'btn primary', disabled: !done, onclick: async ev => { ev.target.disabled = true; try { status.textContent = 'Mixing…'; const mix = await buildDubMix(p); status.textContent = ''; playBuffer(mix, 0, undefined, video, p.plan.start); } catch (e) { toast(e.message, true); } ev.target.disabled = false; } }, '▶ Preview dubbed scene'),
           h('button', { class: 'btn', onclick: stopPlayback }, 'Stop'),
           h('button', { class: 'btn', disabled: !done, onclick: async () => { try { const mix = await buildDubMix(p); downloadBlob(Dub.encodeWav([...Array(mix.numberOfChannels).keys()].map(c => mix.getChannelData(c)), mix.sampleRate), `${p.name.replace(/[^\w-]+/g, '_')}_dub.wav`); } catch (e) { toast(e.message, true); } } }, 'Download dub WAV'))),
-      callout('Lip-sync: the mouth follows the original actor’s performance, so keep your delivery close to the original timing. Re-animating lips to new words is not available on-device yet.'),
+      callout('Lip-sync: for lines with “Lip-sync the mouth” on, the recast face’s jaw and lips are driven by your take (loudness opens the jaw, the sound’s brightness spreads or rounds the lips) and a mouth interior is drawn in. It needs Replace face on for the speaker. It reads sounds, not words, so it looks natural for normal talking but will not match every syllable like a studio dub.'),
       h('a', { class: 'btn primary block', href: `#/p/${p.id}/render` }, 'Next: Render'));
   };
-  draw();
+  drawNow();
   return wrap;
 }
 
@@ -978,7 +1079,8 @@ async function pump() {
       job.info = { phase: 'mixing dub' }; job.onUpdate?.();
       try { audioBuffer = await buildDubMix(p); } catch (e) { toast('Dub mix failed, using original audio: ' + e.message, true, 7000); }
     }
-    const res = await renderProject(p, { file: S.file, meta: p.meta, profiles: S.profiles, wardrobe: S.wardrobe, analysis: p.analysis, motionParams: p.motion || {}, audioBuffer, ...(await stageAssets(p)) }, {
+    let lips = null; try { lips = await computeLips(p); } catch (e) { toast('Lip-sync skipped: ' + e.message, true); }
+    const res = await renderProject(p, { file: S.file, meta: p.meta, profiles: S.profiles, wardrobe: S.wardrobe, analysis: p.analysis, motionParams: p.motion || {}, audioBuffer, lips, ...(await stageAssets(p)) }, {
       ...job.opts, signal: job.ctrl.signal,
       onProgress: (d, t, info) => { job.progress = d / t; job.info = info; job.done = d; job.total = t; job.onUpdate?.(); if (S.top && (!job._tt || performance.now() - job._tt > 800)) { job._tt = performance.now(); setTop(...S.top); } },
     });
@@ -1192,36 +1294,47 @@ async function library() {
   ];
 }
 
-/** One photo → a complete character: face (full-res crop), hair layer, and, if the whole body is in the photo,
- *  a rigged body and T-pose model. Each step reports honestly whether it ran. */
-async function quickCharacter(f) {
+/** One photo → every reference view (front, ¾ left/right, hair, full body, T-pose, side, rear).
+ *  Each view is shown before saving, labelled by how it was made, and can be kept or dropped. */
+const KIND = { captured: ['From your photo', 'ok'], synthesized: ['Synthesized', 'v'], estimated: ['Estimate: check it', 'warn'] };
+async function quickCharacter(f, existing = null) {
   const ms = await modelStatus();
   if (!ms.face) { toast('Install the Face Landmarker first (Models).', true); location.hash = '#/models'; return; }
-  const self = !S.profiles.some(x => x.self), pr = newProfile(self ? 'Myself' : 'New character', self);
-  const steps = [['face', 'Face texture and 3D face mesh'], ['hair', 'Hair layer'], ['body', 'Full body rig'], ['tpose', 'T-pose model']];
-  const rows = Object.fromEntries(steps.map(([k, l]) => [k, h('div', { class: 'row between' }, h('span', null, l), chip('waiting'))]));
-  const set = (k, txt, kind) => rows[k].lastChild.replaceWith(chip(txt, kind));
-  const box = h('div', { class: 'modal' }, h('div', { class: 'box' }, h('h2', null, 'Building your character'), h('p', { class: 'muted small' }, 'Everything is generated from this one photo, on this device.'), ...Object.values(rows)));
+  const order = [['front', 'Front face'], ['left', 'Left profile (¾)'], ['right', 'Right profile (¾)'], ['hair', 'Hairstyle'], ['body', 'Full body'], ['tpose', 'T-pose'], ['side', 'Side body'], ['rear', 'Rear body']];
+  const cards = Object.fromEntries(order.map(([k, l]) => [k, h('div', { class: 'slot' }, h('div', { class: 'ph checker' }, 'waiting'), h('h3', null, l), chip('waiting'))]));
+  const keep = {}, made = {};
+  const status = h('p', { class: 'muted small' }, 'Generating every view from this one photo, on this device…');
+  const saveBtn = h('button', { class: 'btn primary', disabled: true }, 'Save character');
+  const box = h('div', { class: 'modal', style: { placeItems: 'start center', overflowY: 'auto' } }, h('div', { class: 'box', style: { width: 'min(980px, 100%)' } },
+    h('h2', null, existing ? `New views for ${existing.name}` : 'Your character from one photo'), status,
+    h('div', { class: 'grid3' }, order.map(([k]) => cards[k])),
+    h('p', { class: 'muted small' }, 'From your photo = cut straight from the picture. Synthesized = re-rendered from your photo with a 3D face mesh or body rig. Estimate = a guess for things the photo never showed (your side and back). Untick anything that looks wrong.'),
+    h('div', { class: 'row', style: { justifyContent: 'flex-end' } }, h('button', { class: 'btn ghost', onclick: () => box.remove() }, 'Cancel'), saveBtn)));
   document.body.appendChild(box);
+  const show = (k, state, v) => {
+    const c = cards[k]; if (!c) return;
+    if (state === 'working') { c.firstChild.textContent = 'working…'; return; }
+    if (!v.ok) { c.firstChild.textContent = v.why || 'not possible'; c.lastChild.replaceWith(chip('skipped', 'bad')); return; }
+    made[k] = v; keep[k] = true;
+    v.canvas.style.cssText = 'width:100%;height:100%;object-fit:contain;border-radius:9px';
+    const ph = h('div', { class: 'ph has checker', style: { padding: 0, overflow: 'hidden' } }, v.canvas);
+    c.replaceChildren(ph, h('h3', null, v.label), chip(...KIND[v.kind]), check('Keep', true, x => (keep[k] = x), 'keep-' + k));
+  };
   try {
-    pr.refs.front = { blob: f, name: f.name, at: Date.now() };
-    set('face', 'working…', 'v'); const a = await analyzeReference(f); pr.refs.front.analysis = a;
-    if (!a.ok) throw new Error('No face found in that photo. Use a photo where your face is clearly visible.');
-    set('face', a.quality.refined ? 'done · full-res crop' : 'done', a.quality.score > 70 ? 'ok' : 'warn');
-    if (ms.multiclass) { set('hair', 'working…', 'v'); try { pr.hair = await extractHair(f, a); set('hair', 'done', 'ok'); } catch (e) { set('hair', 'skipped: ' + e.message.slice(0, 40), 'warn'); } } else set('hair', 'needs Multiclass model', 'warn');
-    if (ms.selfie && (ms.pose_lite || ms.pose_full)) {
-      set('body', 'working…', 'v');
-      try {
-        const b = await analyzeBody(f, blobToCanvas);
-        if (b.missing.some(k => /An|Kn/.test(k))) throw new Error('legs not fully in the photo');
-        pr.refs.body = { blob: f, name: f.name, at: Date.now() }; pr.bodyPhoto = b; pr.body = b; set('body', 'done', 'ok');
-        set('tpose', 'working…', 'v'); pr.body = await makeTPoseModel(b, { toCanvas: blobToCanvas, Renderer: FaceRenderer }); set('tpose', 'done', 'ok');
-      } catch (e) { set('body', 'skipped: ' + e.message.slice(0, 44), 'warn'); set('tpose', 'needs a full-body photo', 'warn'); }
-    } else { set('body', 'needs Pose + Selfie models', 'warn'); set('tpose', 'needs Pose + Selfie models', 'warn'); }
-    await db.put('profiles', pr); await reloadLibrary();
-    await new Promise(r => setTimeout(r, 900));
-    box.remove(); toast(pr.self ? 'Character ready' : 'Character ready. Confirm consent before using it.'); location.hash = `#/character/${pr.id}`;
-  } catch (e) { box.remove(); toast(e.message, true, 7000); }
+    await generateAllViews(f, ms, show);
+    status.textContent = 'Check each view, then save. Nothing is stored until you do.';
+    saveBtn.disabled = false;
+    saveBtn.onclick = async () => {
+      saveBtn.disabled = true;
+      const self = !S.profiles.some(x => x.self);
+      const pr = existing || newProfile(self ? 'Myself' : 'New character', self);
+      for (const [k, v] of Object.entries(made)) if (keep[k]) await v.apply(pr);
+      if (!keep.front && !pr.refs.front) { toast('The front face is needed to recast. Keep it or add one later.', true); }
+      pr.updatedAt = Date.now(); await db.put('profiles', pr); await reloadLibrary(); dropRuntime();
+      box.remove(); toast(pr.self || pr.consent ? 'Character saved' : 'Character saved. Confirm consent before using it.');
+      location.hash = `#/character/${pr.id}`; if (existing) route();
+    };
+  } catch (e) { status.textContent = e.message; toast(e.message, true, 7000); }
 }
 
 // ───────────────────────── 6. Character builder ─────────────────────────
@@ -1243,6 +1356,7 @@ async function characterBuilder(id) {
       const isFace = ['front', 'left', 'right', 'hair'].includes(s.key);
       return h('div', { class: 'slot' }, h('div', { class: 'row between' }, h('h3', null, s.label)), ph,
         q ? h('div', { class: 'row' }, chip(r.analysis.ok ? `${q.score}/100` : 'no face', r.analysis.ok && q.score > 70 ? 'ok' : 'warn'), r.analysis.ok ? chip(`yaw ${q.yaw}`) : null) : null,
+        r?.generated ? chip(['side', 'rear'].includes(s.key) ? 'estimate' : 'generated', ['side', 'rear'].includes(s.key) ? 'warn' : 'v') : null,
         q?.issues?.length ? h('p', { class: 'small', style: { color: 'var(--warn)' } }, q.issues.join(' · ')) : null,
         h('p', { class: 'muted small' }, s.used),
         h('div', { class: 'row' },
@@ -1250,6 +1364,7 @@ async function characterBuilder(id) {
             pr.refs[s.key] = { blob: f, name: f.name, at: Date.now() };
             if (isFace && ms.face && s.key !== 'hair') { try { toast('Analyzing face…'); pr.refs[s.key].analysis = await analyzeReference(f); } catch (e) { toast('Analysis failed: ' + e.message, true); } }
             if (s.key === 'body') { try { toast('Rigging your body…'); pr.bodyPhoto = await analyzeBody(f, blobToCanvas); if (!pr.body?.source?.startsWith('tpose')) pr.body = pr.bodyPhoto; } catch (e) { toast('Body analysis failed: ' + e.message, true, 7000); } }
+            if (s.key === 'side' || s.key === 'rear') { try { toast('Rigging…'); const b = await analyzeBody(f, blobToCanvas); if (s.key === 'rear') { b.source = 'rear-photo'; pr.bodyRear = b; } else { b.source = 'side-photo'; pr.bodySide = b; } } catch (e) { toast('Could not rig that photo: ' + e.message, true, 7000); } }
             if (s.key === 'tpose') { try { toast('Rigging your T-pose…'); pr.body = { ...(await analyzeBody(f, blobToCanvas)), source: 'tpose-photo', at: Date.now() }; } catch (e) { toast('T-pose analysis failed: ' + e.message, true, 7000); } }
             await save(); draw();
           }, { cls: 'btn sm' }),
@@ -1281,7 +1396,7 @@ async function characterBuilder(id) {
       !ms.face ? callout(h('span', null, 'Install the Face Landmarker to analyze photos. ', h('a', { href: '#/models' }, 'Model Manager')), 'warn') : null,
       miss.length ? callout(`Optional: ${miss.join(', ')}. With one photo, turned heads are rendered from your front photo using the 3D face mesh. Real side photos add detail the front photo cannot show (ears, the far cheek, profile shape).`) : null,
       needsAnalysis.length && ms.face ? h('button', { class: 'btn', onclick: async () => { for (const k of needsAnalysis) { try { pr.refs[k].analysis = await analyzeReference(pr.refs[k].blob); } catch (e) { toast(e.message, true); } } await save(); draw(); } }, `Analyze ${needsAnalysis.length} photo(s)`) : null,
-      h('h2', null, 'Reference photos'),
+      h('div', { class: 'row between' }, h('h2', null, 'Reference photos'), fileButton('✦ Generate all views from one photo', 'image/*', f => quickCharacter(f, pr), { cls: 'btn sm primary' })),
       h('p', { class: 'muted small' }, 'Front face: look at the camera, even light, face filling at least a third of the photo, no glasses or hair over the eyes. Profiles: turn about 45° and 90°.'),
       slots,
       panel(h('h2', null, 'Hair'),
@@ -1404,7 +1519,7 @@ async function modelManager() {
             draw();
           } }, inst ? 'Re-download' : 'Install'),
           fileButton('Import file', '.task,.tflite,application/octet-stream', async f => { try { await importModel(m.key, f); toast('Imported'); } catch (e) { toast(e.message, true); } draw(); }, { cls: 'btn sm' }),
-          inst ? h('button', { class: 'btn sm', onclick: async ev => {
+          inst && m.kind !== 'onnx' ? h('button', { class: 'btn sm', onclick: async ev => {
             ev.target.disabled = true;
             try { const t0 = performance.now(); const task = await getTask(m.key, 'IMAGE'); const c = document.createElement('canvas'); c.width = c.height = 256; c.getContext('2d').fillRect(0, 0, 256, 256); const t1 = performance.now(); if (m.key === 'selfie' || m.key === 'multiclass') task.segment(c, () => {}); else task.detect(c); toast(`${m.name}: started in ${(t1 - t0).toFixed(0)} ms, inference ${(performance.now() - t1).toFixed(0)} ms on ${mpRuntime.delegate[m.key]}`); }
             catch (e) { toast(`${m.name} failed to start: ${e.message}`, true, 7000); }
@@ -1453,7 +1568,7 @@ async function settingsScreen() {
       h('div', { class: 'row' }, h('button', { class: 'btn', onclick: async () => toast((await requestPersist()) ? 'Persistent storage granted' : 'Safari declined. Adding to Home Screen improves retention.') }, 'Request persistent storage'),
         h('button', { class: 'btn danger', onclick: async () => { if (!(await confirmBox('Delete all RECAST data?', 'Projects, characters, wardrobe, models and exports on this device will be erased.', 'Erase everything'))) return; disposeAll(); await db.wipe(); S.project = null; S.file = null; await reloadLibrary(); toast('All data erased'); location.hash = '#/'; } }, 'Delete all data'))),
     panel(h('h2', null, 'About & licenses'),
-      h('p', { class: 'small' }, 'RECAST AI+ v0.5 · private, local, static web app.'),
+      h('p', { class: 'small' }, 'RECAST AI+ v0.6 · private, local, static web app.'),
       h('ul', { class: 'small muted' },
         h('li', null, 'MediaPipe Tasks Vision (Google) — Apache-2.0. Pose, Face, Hand Landmarker and Image Segmenter models: Apache-2.0, see each model card.'),
         h('li', null, 'Mediabunny (Vanilagy) — MPL-2.0. MP4/MOV demuxing, decoding and encoding via WebCodecs.'),

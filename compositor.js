@@ -6,6 +6,7 @@ import { buildMotion } from './smoothing.js';
 import { blobToCanvas, buildProfileMesh, tinyCrop, faceBox, recolorCanvas } from './profile.js';
 import { getTask, segment } from './models.js';
 import { buildRig, deformRig, poseJoints } from './puppet.js';
+import { applyMouth, drawMouthInterior } from './lipsync.js';
 
 export const KEY_PROPS = ['x', 'y', 'scale', 'rot', 'opacity'];
 export const DEFAULT_ENTRY = () => ({
@@ -25,7 +26,7 @@ export const outfitOn = e => (e.outfit ? !!e.outfit.on : true);
 const inRanges = (ranges, k) => (ranges || []).some(([a, b]) => k >= a && k <= b);
 
 /** Load everything a project's cast needs into memory. */
-export async function prepareRuntime(project, { profiles, wardrobe, analysis, motionParams, plate = null, background = null }) {
+export async function prepareRuntime(project, { profiles, wardrobe, analysis, motionParams, plate = null, background = null, lips = null }) {
   const plan = project.plan, W = plan.width, H = plan.height;
   const rt = { W, H, photo: !!plan.photo, entries: [], face: null, needsPerson: false, needsMulti: false, state: new Map(), warnings: [] };
   try { rt.face = new FaceRenderer(W, H); } catch (e) { rt.warnings.push(e.message); }
@@ -74,6 +75,7 @@ export async function prepareRuntime(project, { profiles, wardrobe, analysis, mo
   if (rt.needsMulti) try { rt.multiTask = await getTask('multiclass', 'VIDEO'); } catch (err) { rt.needsMulti = false; rt.warnings.push('Clothing recolor off: ' + err.message); }
   rt.work = mk(W, H); rt.tmp = mk(W, H); rt.maskC = mk(W, H);
   rt.stage = project.stage || { mode: 'scene' };
+  rt.lips = lips; // Map trackId → Map frame → {open, wide, neutral}
   if (plate) { rt.plate = mk(W, H); rt.plate.getContext('2d').drawImage(await blobToCanvas(plate, 4096), 0, 0, W, H); }
   if (rt.stage.mode === 'background') {
     rt.bg = mk(W, H); const bctx = rt.bg.getContext('2d');
@@ -153,7 +155,9 @@ const expandBox = (b, W, H, f = 0.15) => { const w = (b[2] - b[0]) * W, h = (b[3
 
 /** Compute face mesh draw for one entry at frame k. Returns {draw, P (target px flat), box} or null. */
 export function faceDraw(rt, r, k, src) {
-  const e = r.e, L = r.motion.face[k];
+  const e = r.e, lip = rt.lips?.get(e.trackId)?.get(k);
+  let L = r.motion.face[k];
+  if (L && lip) L = applyMouth(L, lip, { neutral: lip.neutral ?? 1, aspect: rt.H / rt.W });
   if (!L || !r.views.length || !r.mesh) return null;
   const W = rt.W, H = rt.H, n = L.length / 3;
   const st = rt.state.get(e.id) || {}; rt.state.set(e.id, st);
@@ -180,7 +184,7 @@ export function faceDraw(rt, r, k, src) {
   const idx = [], depth = [];
   r.mesh.tris.forEach(([a, b, c], t) => {
     const f = r.mesh.flags[t];
-    if (e.face.keepMouth && f & 1) return; if (e.face.keepEyes && f & 2) return;
+    if ((e.face.keepMouth || lip) && f & 1) return; if (e.face.keepEyes && f & 2) return;
     if (best.key !== 'front' && triSign(ref, a, b, c) <= 0) return;
     if (triSign(P, a, b, c) <= 0) return;
     idx.push(a, b, c); depth.push(L[a * 3 + 2] + L[b * 3 + 2] + L[c * 3 + 2]);
@@ -321,7 +325,11 @@ export function composeFrame(rt, src, k, opts = {}) {
   if (rt.face) {
     const draws = [];
     for (const r of active) { if (!r.e.face.on) continue; const fd = faceDraw(rt, r, k, src); if (fd) { fds.set(r.e.id, fd); draws.push(fd.draw); } }
-    if (draws.length) { rt.face.render(out, draws); ctx.drawImage(rt.face.canvas, 0, 0); stats.faces = draws.length; }
+    if (draws.length) {
+      // lip-synced lines: draw the new mouth cavity first, so the lips and face mesh frame it
+      for (const r of active) { const lip = rt.lips?.get(r.e.trackId)?.get(k), fd = fds.get(r.e.id); if (lip && fd) drawMouthInterior(ctx, fd.P, lip.open); }
+      rt.face.render(out, draws); ctx.drawImage(rt.face.canvas, 0, 0); stats.faces = draws.length;
+    }
   }
   // 3) hair
   for (const r of active) if (r.hair) { const fd = fds.get(r.e.id); if (fd) { drawHair(ctx, r, fd, rt); stats.hair++; } }

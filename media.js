@@ -82,6 +82,8 @@ export async function probe(file) {
       await once(v, 'loadedmetadata');
       meta.width = v.videoWidth; meta.height = v.videoHeight; meta.duration = v.duration;
       meta.engine = 'video-element';
+      // <video> cannot always tell whether there is sound; Safari exposes audioTracks, others do not.
+      if (!meta.audio.length) { const n = v.audioTracks?.length; if (n !== 0) meta.audio = [{ codec: n ? 'audio' : 'unknown', channels: 2, sampleRate: 0, guessed: !n }]; }
     } finally { URL.revokeObjectURL(url); }
   }
   if (!meta.fps || !isFinite(meta.fps)) { meta.fps = 30; meta.fpsGuessed = true; }

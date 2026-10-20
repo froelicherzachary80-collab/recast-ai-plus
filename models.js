@@ -13,6 +13,7 @@ export const MODELS = [
   { key: 'face', name: 'Face Landmarker', feature: '478-point face mesh, expressions & head pose (Face MotionLock, reference analysis)', url: `${G}/face_landmarker/face_landmarker/float16/latest/face_landmarker.task`, approx: '≈ 3.6 MB', license: 'Apache-2.0 (MediaPipe model card)', required: true },
   { key: 'hand', name: 'Hand Landmarker', feature: 'Hand landmarks for Gesture MotionLock overlay', url: `${G}/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task`, approx: '≈ 7.5 MB', license: 'Apache-2.0 (MediaPipe model card)' },
   { key: 'selfie', name: 'Selfie Segmenter', feature: 'Person masks: garment clipping & mask inspection', url: `${G}/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite`, approx: '≈ 0.25 MB', license: 'Apache-2.0 (MediaPipe model card)' },
+  { key: 'demucs', kind: 'onnx', name: 'HTDemucs stem separator', feature: 'Splits a video’s sound into character voices, song vocals and music (Dub Studio)', url: 'https://huggingface.co/timcsy/demucs-web-onnx/resolve/main/htdemucs_embedded.onnx', approx: '≈ 172 MB', license: 'MIT (Meta HTDemucs; ONNX export by demucs-web)' },
   { key: 'multiclass', name: 'Selfie Multiclass 256', feature: 'Hair / skin / clothes classes: hair extraction & clothing recolor', url: `${G}/image_segmenter/selfie_multiclass_256x256/float32/latest/selfie_multiclass_256x256.tflite`, approx: '≈ 16 MB', license: 'Apache-2.0 (MediaPipe model card)' },
 ];
 export const UNAVAILABLE_MODELS = [

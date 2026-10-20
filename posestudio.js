@@ -60,13 +60,14 @@ export async function poseStudio({ profiles, profileId, setTop, go, onCleanup })
   let W = SIZES[st.size][0], H = SIZES[st.size][1];
   const gl = new FaceRenderer(W, H), out = mk(W, H), bgC = mk(W, H), blank = mk(W, H), layerC = mk(W, H);
   const rigs = new Map();
-  const rigFor = async prof => {
-    const k = prof.id + ':' + (prof.body.at || prof.updatedAt || 0);
-    if (!rigs.has(prof.id) || rigs.get(prof.id).k !== k) {
-      const I = restInfo(prof.body.joints), rig = buildRig(prof.body.alpha, prof.body.w, prof.body.h, prof.body.joints, { cells: 52 });
-      rigs.set(prof.id, { k, I, rig, tex: gl.texture('studio:' + k, await blobToCanvas(prof.body.png, 4096)), prof });
+  const bodyFor = (prof, view) => (view === 'back' && prof.bodyRear?.ok ? prof.bodyRear : view === 'side' && prof.bodySide?.ok ? prof.bodySide : prof.body);
+  const rigFor = async (prof, view = 'front') => {
+    const body = bodyFor(prof, view), id = prof.id + ':' + view, k = id + ':' + (body.at || prof.updatedAt || 0) + ':' + body.w;
+    if (!rigs.has(id) || rigs.get(id).k !== k) {
+      const I = restInfo(body.joints), rig = buildRig(body.alpha, body.w, body.h, body.joints, { cells: 52 });
+      rigs.set(id, { k, I, rig, tex: gl.texture('studio:' + k, await blobToCanvas(body.png, 4096)), prof });
     }
-    return rigs.get(prof.id);
+    return rigs.get(id);
   };
   const profOf = L => profiles.find(p => p.id === L.profileId);
   const relaxedAt = (R, x, floorY, s) => { const P = restPose(R.I, x, 0, s), J = fk(P, R.I); P.y = floorY - lowest(J); return P; };
@@ -77,11 +78,11 @@ export async function poseStudio({ profiles, profileId, setTop, go, onCleanup })
     st.layers.push(L); st.sel = L.id; return L;
   };
   if (!st.layers.length) await addLayer(first);
-  for (const L of st.layers) await rigFor(profOf(L));
+  for (const L of st.layers) await rigFor(profOf(L), L.view || 'front');
   if (!st.layers.some(L => L.id === st.sel)) st.sel = st.layers[0].id;
   const save = () => db.put('kv', st).catch(() => {});
   const sel = () => st.layers.find(L => L.id === st.sel);
-  const R_ = L => rigs.get(L.profileId);
+  const R_ = L => rigs.get(L.profileId + ':' + (L.view || 'front'));
   const danceOf = L => st.dances.find(d => d.id === L.danceId) || null;
   const anyDance = () => st.layers.some(L => danceOf(L)?.keys.length);
   const fromDance = (L, d, p) => { const R = R_(L), k = (L.pose.s * R.I.torso) / d.origin.torsoPx; return { x: L.pose.x + (p.x - d.origin.x) * k, y: L.pose.y + (p.y - d.origin.y) * k, s: L.pose.s * (p.s / d.origin.s), a: p.a }; };
@@ -217,7 +218,13 @@ export async function poseStudio({ profiles, profileId, setTop, go, onCleanup })
           h('button', { class: 'btn sm', onclick: () => { const i = st.layers.indexOf(L); if (i < st.layers.length - 1) { st.layers.splice(i, 1); st.layers.splice(i + 1, 0, L); save(); drawPanels(); paint(); } } }, 'Bring forward'),
           h('button', { class: 'btn sm', onclick: () => { const i = st.layers.indexOf(L); if (i > 0) { st.layers.splice(i, 1); st.layers.splice(i - 1, 0, L); save(); drawPanels(); paint(); } } }, 'Send back'),
           st.layers.length > 1 ? h('button', { class: 'btn sm ghost danger', onclick: () => { st.layers = st.layers.filter(Y => Y !== L); st.sel = st.layers[0].id; save(); drawPanels(); paint(); } }, 'Remove') : null),
-        h('p', { class: 'muted small' }, 'Only you and people who agreed (consent recorded) can be added.')),
+        h('label', { class: 'f' }, 'Facing', seg([['front', 'Front'], ['side', prof.bodySide?.ok ? 'Side' : 'Side (none)'], ['back', prof.bodyRear?.ok ? 'Back' : 'Back (none)']], L.view || 'front', async v => {
+          if ((v === 'side' && !prof.bodySide?.ok) || (v === 'back' && !prof.bodyRear?.ok)) { toast(`No ${v} view for ${prof.name}. Generate views from one photo in Characters.`, true); drawPanels(); return; }
+          const was = L.view || 'front'; L.view = v; await rigFor(prof, v);
+          if ((was === 'back') !== (v === 'back')) L.pose = mirrorPose(L.pose, L.pose.x); // keep the same arm on the same side of the screen
+          L.danceId = null; save(); drawPanels(); paint();
+        })),
+        h('p', { class: 'muted small' }, 'Only you and people who agreed (consent recorded) can be added. Side and back views are estimates unless you added real photos.')),
       sec(`Model · ${prof.name}`, false,
         h('div', { class: 'row' }, chip(prof.body.source === 'tpose-photo' ? 'T-pose photo' : prof.body.source === 'tpose-generated' ? 'T-pose (generated)' : 'original photo pose', prof.body.source?.startsWith('tpose') ? 'ok' : 'warn')),
         h('p', { class: 'muted small' }, 'A T-pose model (arms straight out) bends best into raised-arm, superhero and dance poses.'),
@@ -228,12 +235,12 @@ export async function poseStudio({ profiles, profileId, setTop, go, onCleanup })
               const src = prof.bodyPhoto || prof.body; if (!prof.bodyPhoto) prof.bodyPhoto = prof.body;
               prof.body = await makeTPoseModel(src, { toCanvas: blobToCanvas, Renderer: FaceRenderer }); prof.updatedAt = Date.now();
               await db.put('profiles', prof); const R = await rigFor(prof);
-              for (const Y of st.layers.filter(Y => Y.profileId === prof.id)) { const cur = Y.pose; Y.pose = relaxedAt(R, cur.x, lowest(fk(cur, R.I)), cur.s); Y.danceId = null; }
+              for (const Y of st.layers.filter(Y => Y.profileId === prof.id && (Y.view || 'front') === 'front')) { const cur = Y.pose; Y.pose = relaxedAt(R, cur.x, lowest(fk(cur, R.I)), cur.s); Y.danceId = null; }
               save(); toast('T-pose model ready'); prof.body.issues?.forEach(i => toast(i, false, 6000));
             } catch (e) { toast('T-pose failed: ' + e.message, true); }
             drawPanels(); paint();
           } }, prof.body.source === 'tpose-generated' ? 'Regenerate T-pose' : 'Make T-pose model'),
-          prof.bodyPhoto && prof.body.source?.startsWith('tpose') ? h('button', { class: 'btn sm', onclick: async () => { prof.body = prof.bodyPhoto; prof.updatedAt = Date.now(); await db.put('profiles', prof); const R = await rigFor(prof); for (const Y of st.layers.filter(Y => Y.profileId === prof.id)) Y.pose = relaxedAt(R, Y.pose.x, lowest(fk(Y.pose, R.I)), Y.pose.s); save(); drawPanels(); paint(); } }, 'Use original photo') : null,
+          prof.bodyPhoto && prof.body.source?.startsWith('tpose') ? h('button', { class: 'btn sm', onclick: async () => { prof.body = prof.bodyPhoto; prof.updatedAt = Date.now(); await db.put('profiles', prof); const R = await rigFor(prof); for (const Y of st.layers.filter(Y => Y.profileId === prof.id && (Y.view || 'front') === 'front')) Y.pose = relaxedAt(R, Y.pose.x, lowest(fk(Y.pose, R.I)), Y.pose.s); save(); drawPanels(); paint(); } }, 'Use original photo') : null,
           h('a', { class: 'btn sm ghost', href: `#/character/${prof.id}` }, 'Upload a real T-pose photo'))),
       sec('Pose library', true,
         h('input', { type: 'text', id: 'pz-q', placeholder: 'Search: hero, couple, dance, flying…', value: query, oninput: e => { query = e.target.value; drawLib(); } }),

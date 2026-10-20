@@ -10,8 +10,8 @@ export const SLOTS = [
   { key: 'hair', label: 'Hairstyle reference', need: 'optional', used: 'Hair overlay (front face photo is used if empty)' },
   { key: 'tpose', label: 'T-pose photo', need: 'optional', used: 'Best Pose Studio model: arms straight out to the sides, facing the camera, head to feet, plain background.' },
   { key: 'body', label: 'Full body', need: 'recommended', used: 'Whole-body Animate: stand facing the camera, head to feet in frame, arms slightly away from the body, plain background.' },
-  { key: 'side', label: 'Side body', need: 'optional', used: 'Stored for V0.2. Not used by v0.1 rendering.' },
-  { key: 'rear', label: 'Rear body', need: 'optional', used: 'Stored for V0.2. Not used by v0.1 rendering.' },
+  { key: 'side', label: 'Side body', need: 'optional', used: 'Pose Studio side view. A real side photo beats the estimate.' },
+  { key: 'rear', label: 'Rear body', need: 'optional', used: 'Pose Studio back view. A real photo of your back beats the estimate.' },
 ];
 export const VIDEO_SLOTS = [
   { key: 'expr', label: 'Expression video', used: 'Stored for V0.2 expression library. Not used by v0.1.' },
