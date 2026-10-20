@@ -1,10 +1,11 @@
-// RECAST AI+ v0.4 — application shell and screens.
+// RECAST AI+ v0.5 — application shell and screens.
 import { h, $, toast, confirmBox, slider, check, seg, chip, progressBar, fileButton, timecode, downloadBlob, shareFile, icon } from './ui.js';
 import { db, uid, storageInfo, requestPersist } from './db.js';
 import { MODELS, UNAVAILABLE_MODELS, modelStatus, downloadModel, importModel, deleteModel, hasModel, getTask, runtime as mpRuntime, loadVision, disposeAll } from './models.js';
 import { probe, makePlan, PRESETS, VIDEO_PRESETS, FrameGrabber, verifyExport, mediabunny, isImageFile } from './media.js';
 import { analyzeVideo, detectPeople } from './analysis.js';
 import { trackSummary, swapTracksFrom, mergeTracks, iou } from './tracker.js';
+import { summarizeTracks, groupTracks, shotLookup } from './people.js';
 import { buildMotion, jitter } from './smoothing.js';
 import { prepareRuntime, composeFrame, drawTracking, disposeRuntime, DEFAULT_ENTRY, KEY_PROPS, outfitOn } from './compositor.js';
 import { interpKeys, clamp } from './geometry.js';
@@ -13,6 +14,7 @@ import { renderProject } from './render.js';
 import { analyzeBody, buildCleanPlate } from './plate.js';
 import * as Dub from './dub.js';
 import { poseStudio } from './posestudio.js';
+import { editStudio } from './editstudio.js';
 import { makeTPoseModel } from './tpose.js';
 import { FaceRenderer } from './facerender.js';
 import { capabilityTest, fmtBytes } from './caps.js';
@@ -109,7 +111,7 @@ function setTop(title, back) {
     S.job ? h('a', { class: 'chip v', href: '#/queue' }, `Rendering ${Math.round((S.job.progress || 0) * 100)}%`) : null);
 }
 function setTabs(active) {
-  const tabs = [['home', '#/', 'Studio'], ['cast', '#/library', 'Characters'], ['pose', '#/pose', 'Pose'], ['shirt', '#/wardrobe', 'Wardrobe'], ['chip', '#/models', 'Models'], ['gear', '#/settings', 'Settings']];
+  const tabs = [['home', '#/', 'Studio'], ['cast', '#/library', 'Characters'], ['pose', '#/pose', 'Pose'], ['film', '#/edit', 'Edit'], ['chip', '#/models', 'Models'], ['gear', '#/settings', 'Settings']];
   $('#tabs').replaceChildren(...tabs.map(([ic, href, label]) => h('a', { href, class: active === href ? 'on' : '' }, icon(ic), label)));
 }
 function steps(pid, cur) {
@@ -133,6 +135,7 @@ async function route() {
     [/^#\/character\/([^/]+)$/, m => characterBuilder(m[1]), '#/library'],
     [/^#\/wardrobe(?:\/([^/]+))?$/, m => wardrobeStudio(m[1]), '#/wardrobe'],
     [/^#\/queue$/, () => renderQueue(), '#/'],
+    [/^#\/edit$/, () => editStudio({ setTop, onCleanup: fn => S.cleanup.push(fn) }), '#/edit'],
     [/^#\/pose(?:\/([^/]+))?$/, async m => { await reloadLibrary(); return poseStudio({ profiles: S.profiles, profileId: m[1], setTop, go: href => (location.hash = href), onCleanup: fn => S.cleanup.push(fn) }); }, '#/pose'],
     [/^#\/models$/, () => modelManager(), '#/models'],
     [/^#\/settings$/, () => settingsScreen(), '#/settings'],
@@ -172,12 +175,14 @@ async function dashboard() {
         } }, 'Delete'))));
   }
   return [
-    h('div', { class: 'hero-slate' }, h('span', { class: 'eyebrow' }, 'Private · on-device · v0.4'), h('h1', null, 'Put yourself in the scene, or on the poster.')),
+    h('div', { class: 'hero-slate' }, h('span', { class: 'eyebrow' }, 'Private · on-device · v0.5'), h('h1', null, 'Put yourself in the scene, or on the poster.')),
     h('a', { class: 'create', href: '#/new' }, h('span', { class: 'plus' }, '+ CREATE NEW RECAST'), h('span', { class: 'muted small' }, 'Video scene or photo poster → actor → your photos → export')),
     missing.length ? callout(h('span', null, 'Install the required models first: ', missing.map(m => m.name).join(', '), '. ', h('a', { href: '#/models' }, 'Open Model Manager')), 'warn') : null,
     panel(h('div', { class: 'row between' }, h('h2', null, 'Projects'), h('div', { class: 'row' }, fileButton('Import project', '.json,application/json', importProjectFile, { cls: 'btn sm ghost' }), h('a', { class: 'btn sm ghost', href: '#/queue' }, 'Render queue'))), list),
     h('div', { class: 'grid2' },
       panel(h('h3', null, 'Characters'), h('p', { class: 'muted small' }, `${S.profiles.length} saved locally. Start with “Myself”.`), h('a', { class: 'btn sm', href: '#/library' }, 'Character Library')),
+      panel(h('h3', null, 'Edit Studio'), h('p', { class: 'muted small' }, 'Make TikTok transition edits from your recasts: beat-synced cuts, flashes, zooms, captions and a film look.'), h('a', { class: 'btn sm', href: '#/edit' }, 'Open Edit Studio')),
+      panel(h('h3', null, 'Wardrobe'), h('p', { class: 'muted small' }, 'Garments for outfit changes.'), h('a', { class: 'btn sm', href: '#/wardrobe' }, 'Wardrobe Studio')),
       panel(h('h3', null, 'Pose Studio'), h('p', { class: 'muted small' }, 'Turn your full-body photo into a posable model: drag joints, make dances, learn moves from any video, export images and videos.'), h('a', { class: 'btn sm', href: '#/pose' }, 'Open Pose Studio')),
       panel(h('h3', null, 'This device'), h('p', { class: 'muted small' }, 'Check WebGPU, codecs, storage and model start-up before your first render.'), h('a', { class: 'btn sm', href: '#/settings' }, 'Run capability test'))),
   ];
@@ -326,6 +331,28 @@ async function importScreen(p) {
 }
 
 // ───────────────────────── 4. Actor detection ─────────────────────────
+// ───────── People: the same person across shots = one cast slot ─────────
+function peopleOf(p) {
+  if (!p.analysis) return [];
+  const ids = new Set(); p.analysis.frames.forEach(fr => fr.people.forEach(q => ids.add(q.id)));
+  if (!p.people) p.people = groupTracks(summarizeTracks(p.analysis.frames, shotLookup(p.analysis.cuts || [])));
+  // reconcile after identity fixes: drop vanished tracks, give new tracks their own person
+  for (const g of p.people) g.tracks = g.tracks.filter(t => ids.has(t));
+  p.people = p.people.filter(g => g.tracks.length);
+  const known = new Set(p.people.flatMap(g => g.tracks)); let n = p.people.length;
+  for (const t of ids) if (!known.has(t)) p.people.push({ id: uid('g'), name: 'Person ' + String.fromCharCode(65 + (n++ % 26)), tracks: [t] });
+  return p.people;
+}
+const personOfTrack = (p, id) => peopleOf(p).find(g => g.tracks.includes(id));
+const shotsOf = (p, g) => { const look = shotLookup(p.analysis.cuts || []), s = new Set(); p.analysis.frames.forEach((fr, f) => { if (fr.people.some(q => g.tracks.includes(q.id))) s.add(look(f)); }); return s.size; };
+function personThumb(p, g, size = 128) {
+  const th = h('canvas', { width: size, height: size, style: { width: size / 2 + 'px', height: size / 2 + 'px', borderRadius: '10px', border: '1px solid var(--line)', flex: 'none' } });
+  let best = -1, bk = -1, bq = null;
+  p.analysis.frames.forEach((fr, k) => fr.people.forEach(q => { if (!g.tracks.includes(q.id)) return; const a = (q.bbox[2] - q.bbox[0]) * (q.bbox[3] - q.bbox[1]) * (q.face ? 3 : 1); if (a > best) { best = a; bk = k; bq = q; } }));
+  if (bk >= 0) grabber().then(gr => gr.get(bk)).then(src => { const [x0, y0, x1, y1] = bq.bbox, W = p.plan.width, H = p.plan.height, s2 = Math.max((x1 - x0) * W, (y1 - y0) * H * 0.5); th.getContext('2d').drawImage(src, (x0 + x1) / 2 * W - s2 / 2, y0 * H, s2, s2, 0, 0, size, size); }).catch(() => {});
+  return th;
+}
+
 async function actorsScreen(p) {
   const ms = await modelStatus();
   const need = ['pose_lite', 'face'].filter(k => !ms[k]);
@@ -339,10 +366,10 @@ async function actorsScreen(p) {
       const res = await analyzeVideo(S.file, p.meta, p.plan, { signal: ctrl.signal, hands: S.settings.hands, poseModel: PRESETS[p.preset].pose, onProgress: (d, t, info) => { prog.set(d / t); progTxt.textContent = `Frame ${d} / ${t} · ${info.people} people · ${info.fps.toFixed(1)} frames/s`; } });
       if (res.cancelled) { toast('Detection cancelled. Nothing was saved.'); }
       else {
-        p.analysis = res; const sum = trackSummary(res.frames);
-        if (!p.selected?.length && sum[0]) p.selected = [sum[0].id];
+        p.analysis = res; p.people = null; const ppl = peopleOf(p);
+        p.selected = ppl[0] ? [...ppl[0].tracks] : [];
         dropRuntime(); await saveProject(true);
-        toast(`Tracked ${sum.length} actor${sum.length === 1 ? '' : 's'} across ${res.completed} frames`);
+        toast(`Found ${ppl.length} ${ppl.length === 1 ? 'person' : 'people'} across ${(res.cuts?.length || 0) + 1} shot${res.cuts?.length ? 's' : ''}`);
       }
     } catch (e) { console.error(e); toast('Detection failed: ' + e.message, true); }
     runBtn.disabled = false; cancelBtn.hidden = true; draw();
@@ -367,11 +394,31 @@ async function actorsScreen(p) {
         const r = cv.getBoundingClientRect(), x = (e.clientX - r.left) / r.width, y = (e.clientY - r.top) / r.height;
         const hit = p.analysis.frames[k].people.filter(q => x >= q.bbox[0] && x <= q.bbox[2] && y >= q.bbox[1] && y <= q.bbox[3]).sort((a, b) => (a.bbox[2] - a.bbox[0]) * (a.bbox[3] - a.bbox[1]) - (b.bbox[2] - b.bbox[0]) * (b.bbox[3] - b.bbox[1]))[0];
         if (!hit) return;
-        p.selected = p.selected.includes(hit.id) ? p.selected.filter(i => i !== hit.id) : [...p.selected, hit.id];
-        saveProject(); paint(); drawList();
+        const g = personOfTrack(p, hit.id), ids = g ? g.tracks : [hit.id];
+        p.selected = p.selected.includes(hit.id) ? p.selected.filter(i => !ids.includes(i)) : [...new Set([...p.selected, ...ids])];
+        saveProject(); paint(); drawList(); drawPeople();
       });
       const scrub = h('input', { type: 'range', class: 'scrub', min: 0, max: p.plan.frames - 1, value: 0, 'aria-label': 'Frame', oninput: e => { k = +e.target.value; paint(); } });
-      const list = h('div', { class: 'stack' });
+      const list = h('div', { class: 'stack' }), peopleBox = h('div', { class: 'stack' });
+      const drawPeople = () => {
+        const ppl = peopleOf(p), cuts = p.analysis.cuts || [];
+        peopleBox.replaceChildren(
+          h('div', { class: 'row between' }, h('h2', null, `People · ${ppl.length}`), h('span', { class: 'small muted' }, `${cuts.length + 1} shot${cuts.length ? 's' : ''} detected`)),
+          h('p', { class: 'muted small' }, 'RECAST groups the same person across different shots by face proportions and hair/skin/clothing colours. Check the groups, merge or split them, then pick everyone you want to recast.'),
+          h('div', { class: 'row' }, h('button', { class: 'btn sm', onclick: () => { p.selected = ppl.flatMap(g => g.tracks); saveProject(); drawPeople(); drawList(); paint(); } }, 'Recast everyone'), h('button', { class: 'btn sm ghost', onclick: () => { p.selected = []; saveProject(); drawPeople(); drawList(); paint(); } }, 'Clear')),
+          ...ppl.map(g => {
+            const on = g.tracks.every(t => p.selected.includes(t)), some = g.tracks.some(t => p.selected.includes(t)), others = ppl.filter(o => o !== g);
+            return h('div', { class: 'panel', style: { borderColor: on ? 'var(--violet)' : '' } },
+              h('div', { class: 'row' }, personThumb(p, g),
+                h('div', { class: 'stack', style: { flex: 1, gap: '4px', minWidth: 0 } },
+                  h('input', { type: 'text', id: 'pn-' + g.id, value: g.name, 'aria-label': 'Person name', style: { minHeight: '34px' }, oninput: e => { g.name = e.target.value; saveProject(); } }),
+                  h('p', { class: 'small muted mono' }, `${shotsOf(p, g)} shot(s) · tracks ${g.tracks.join(', ')}`)),
+                h('span', { class: 'chip toggle-chip', role: 'button', tabindex: 0, 'aria-pressed': String(on), onclick: () => { p.selected = on || some ? p.selected.filter(t => !g.tracks.includes(t)) : [...new Set([...p.selected, ...g.tracks])]; saveProject(); drawPeople(); drawList(); paint(); } }, on ? 'Recasting' : 'Recast')),
+              h('div', { class: 'row small' },
+                others.length ? h('select', { 'aria-label': 'Merge into person', style: { width: 'auto' }, onchange: e => { const o = ppl.find(x => x.id === e.target.value); if (!o) return; o.tracks.push(...g.tracks); p.people = ppl.filter(x => x !== g); saveProject(); toast(`${g.name} merged into ${o.name}`); drawPeople(); } }, h('option', { value: '' }, 'Same person as…'), others.map(o => h('option', { value: o.id }, o.name))) : null,
+                g.tracks.length > 1 ? h('select', { 'aria-label': 'Split track', style: { width: 'auto' }, onchange: e => { const t = +e.target.value; if (!t) return; g.tracks = g.tracks.filter(x => x !== t); p.people.push({ id: uid('g'), name: `Person ${String.fromCharCode(65 + (p.people.length % 26))}`, tracks: [t] }); saveProject(); drawPeople(); } }, h('option', { value: '' }, 'Not the same person: split track…'), g.tracks.map(t => h('option', { value: t }, `Track ${t}`))) : null));
+          }));
+      };
       const drawList = () => {
         const sum = trackSummary(p.analysis.frames);
         const ids = sum.map(s => s.id);
@@ -393,13 +440,14 @@ async function actorsScreen(p) {
         }));
         if (!sum.length) list.append(callout('No people were detected. Try a clip where the actor is larger in frame, or the Mobile Quality preset.', 'warn'));
       };
-      drawList(); await paint();
+      drawList(); drawPeople(); await paint();
       parts.push(
         h('div', { class: 'monitor' }, cv, tc, h('div', { class: 'tag' }, 'TRACKING')),
         h('div', { class: 'transport' }, h('button', { class: 'btn sm', 'aria-label': 'Previous frame', onclick: () => { k = Math.max(0, k - 1); scrub.value = k; paint(); } }, '‹'), h('button', { class: 'btn sm', 'aria-label': 'Next frame', onclick: () => { k = Math.min(p.plan.frames - 1, k + 1); scrub.value = k; paint(); } }, '›'), h('span'), scrub, h('span')),
         h('p', { class: 'muted small' }, 'Tap a person to select them. Dashed boxes are not selected. Coverage bars: full height = face found, half = body only, gap = not detected (long gaps are never invented).'),
-        list,
-        h('a', { class: 'btn primary block', href: `#/p/${p.id}/cast` }, `Next: cast ${p.selected.length || 0} selected actor${p.selected.length === 1 ? '' : 's'}`));
+        peopleBox,
+        h('details', { class: 'panel' }, h('summary', null, h('h2', null, `Tracks · ${trackSummary(p.analysis.frames).length} (advanced)`)), h('p', { class: 'muted small' }, 'A track is one person inside one shot. Fix swapped identities here.'), list),
+        h('a', { class: 'btn primary block', href: `#/p/${p.id}/cast` }, (() => { const n = peopleOf(p).filter(g => g.tracks.some(t => p.selected.includes(t))).length; return `Next: cast ${n} ${n === 1 ? 'person' : 'people'}`; })()));
     }
     wrap.replaceChildren(...parts);
   };
@@ -423,7 +471,9 @@ function ensureEntries(p) {
   for (const id of p.selected) if (!p.cast.some(e => e.trackId === id)) {
     const e = DEFAULT_ENTRY(); e.trackId = id;
     const prof = S.profiles.find(x => x.self) || S.profiles[0];
-    e.profileId = p.cast.length === 0 ? prof?.id || null : null;
+    const g = personOfTrack(p, id), lead = g && p.cast.find(c => g.tracks.includes(c.trackId));
+    e.profileId = lead ? lead.profileId : p.cast.length === 0 ? prof?.id || null : null;
+    if (lead) { Object.assign(e.face, lead.face); e.hair = { ...lead.hair }; e.outfit = { ...(lead.outfit || { on: false }) }; e.body = { ...(lead.body || { on: false }) }; e.top = { ...lead.top }; e.bottom = { ...lead.bottom }; e.recolor = { ...lead.recolor }; p.cast.push(e); continue; }
     applyModeDefaults(e, p.mode, S.profiles.find(x => x.id === e.profileId), p.defaults);
     p.cast.push(e);
   }
@@ -434,32 +484,40 @@ async function castScreen(p) {
   const wrap = h('div', { class: 'stack' });
   const draw = async () => {
     const rows = [];
-    for (const e of p.cast.filter(x => p.selected.includes(x.trackId))) {
-      // actor thumbnail: crop of the frame with the best face
-      const fi = p.analysis.frames.findIndex(fr => fr.people.some(q => q.id === e.trackId && q.face)) ;
-      const k = fi >= 0 ? fi : p.analysis.frames.findIndex(fr => fr.people.some(q => q.id === e.trackId));
-      const th = h('canvas', { width: 128, height: 128, style: { width: '64px', height: '64px', borderRadius: '10px', border: '1px solid var(--line)' } });
-      if (k >= 0) g.get(k).then(src => { const q = p.analysis.frames[k].people.find(x => x.id === e.trackId); const [x0, y0, x1, y1] = q.bbox; const W = p.plan.width, H = p.plan.height; const s = Math.max((x1 - x0) * W, (y1 - y0) * H * 0.5); th.getContext('2d').drawImage(src, (x0 + x1) / 2 * W - s / 2, y0 * H, s, s, 0, 0, 128, 128); });
+    const ppl = peopleOf(p).filter(g => g.tracks.some(t => p.selected.includes(t)));
+    const usedBy = id => ppl.filter(g => p.cast.find(e => e.trackId === g.tracks.find(t => p.selected.includes(t)))?.profileId === id).map(g => g.name);
+    for (const g of ppl) {
+      const entries = p.cast.filter(e => g.tracks.includes(e.trackId) && p.selected.includes(e.trackId));
+      if (!entries.length) continue;
+      const e = entries[0], all = fn => { for (const x of entries) fn(x); saveProject(); };
       const prof = S.profiles.find(x => x.id === e.profileId);
       const consentOk = prof && (prof.self || prof.consent);
-      const garmentSel = (part) => h('select', { 'aria-label': part, onchange: ev => { e[part].garmentId = ev.target.value || null; saveProject(); } }, h('option', { value: '' }, part === 'top' ? 'No top overlay' : 'No bottom overlay'), S.wardrobe.filter(w => w.kind === part).map(w => h('option', { value: w.id, selected: e[part].garmentId === w.id }, w.name)));
-      rows.push(h('div', { class: 'panel', style: { borderColor: colorFor(e.trackId) } },
-        h('div', { class: 'row' }, th, h('div', { class: 'stack', style: { flex: 1, gap: '4px' } }, h('h3', { style: { color: colorFor(e.trackId) } }, `Actor ${e.trackId} →`, ' ', prof ? prof.name : 'not cast'), h('div', { class: 'row' }, prof ? (consentOk ? chip(prof.self ? 'self' : 'consent recorded', 'ok') : chip('consent missing', 'bad')) : chip('choose a character', 'warn'), check('Enabled', e.enabled, v => { e.enabled = v; saveProject(); })))),
-        h('label', { class: 'f' }, 'Character', h('select', { onchange: ev => { if (ev.target.value === '__new') { location.hash = '#/character/new'; return; } e.profileId = ev.target.value || null; applyModeDefaults(e, p.mode, S.profiles.find(x => x.id === e.profileId), { hair: e.hair.on, outfit: outfitOn(e) }); saveProject(); draw(); } },
-          h('option', { value: '' }, '— Keep original actor —'), S.profiles.map(pr => h('option', { value: pr.id, selected: pr.id === e.profileId }, pr.name + (pr.self ? ' (me)' : ''))), h('option', { value: '__new' }, '+ New character…'))),
-        prof && !prof.refs?.front?.analysis?.ok ? callout(h('span', null, `${prof.name} has no analyzed front face photo yet. `, h('a', { href: `#/character/${prof.id}` }, 'Add references')), 'warn') : null,
+      const garmentSel = (part) => h('select', { 'aria-label': part, onchange: ev => all(x => (x[part].garmentId = ev.target.value || null)) }, h('option', { value: '' }, part === 'top' ? 'No top overlay' : 'No bottom overlay'), S.wardrobe.filter(w => w.kind === part).map(w => h('option', { value: w.id, selected: e[part].garmentId === w.id }, w.name)));
+      rows.push(h('div', { class: 'panel', style: { borderColor: prof ? 'var(--violet)' : '' } },
+        h('div', { class: 'row' }, personThumb(p, g), h('div', { class: 'stack', style: { flex: 1, gap: '4px' } }, h('h3', null, `${g.name} →`, ' ', prof ? prof.name : 'not cast'),
+          h('p', { class: 'small muted mono' }, `${shotsOf(p, g)} shot(s) · ${entries.length} track(s)`),
+          h('div', { class: 'row' }, prof ? (consentOk ? chip(prof.self ? 'self' : 'consent recorded', 'ok') : chip('consent missing', 'bad')) : chip('choose a character', 'warn'), check('Enabled', e.enabled, v => all(x => (x.enabled = v)))))),
+        h('label', { class: 'f' }, 'Character', h('select', { onchange: ev => { if (ev.target.value === '__new') { location.hash = '#/character/new'; return; } const pid = ev.target.value || null; all(x => { x.profileId = pid; applyModeDefaults(x, p.mode, S.profiles.find(y => y.id === pid), { hair: e.hair.on, outfit: outfitOn(e), body: !!e.body?.on }); }); draw(); } },
+          h('option', { value: '' }, '— Keep original actor —'), S.profiles.map(pr => { const u = usedBy(pr.id).filter(n => n !== g.name); return h('option', { value: pr.id, selected: pr.id === e.profileId }, pr.name + (pr.self ? ' (me)' : '') + (u.length ? ` · also ${u.join(', ')}` : '')); }), h('option', { value: '__new' }, '+ New character…'))),
+        prof && !prof.refs?.front?.analysis?.ok ? callout(h('span', null, `${prof.name} has no analyzed face photo yet. `, h('a', { href: `#/character/${prof.id}` }, 'Add one photo')), 'warn') : null,
         prof && !consentOk ? callout(h('span', null, 'Consent is required before this likeness can be used. ', h('a', { href: `#/character/${prof.id}` }, 'Confirm consent')), 'bad') : null,
         h('div', { class: 'stack', style: { gap: '8px' } },
-          check('Replace face', e.face.on, v => { e.face.on = v; saveProject(); }),
-          check('Change hair (use my hairstyle)', e.hair.on, v => { e.hair.on = v; saveProject(); draw(); }),
-          h('p', { class: 'muted small', style: { marginLeft: '30px' } }, e.hair.on ? 'Your hair layer is placed over the actor’s head.' : 'Keeping the original actor’s hair.'),
-          check('Replace whole body (Animate)', !!e.body?.on, v => { e.body = { ...(e.body || { light: 0.6, opacity: 1 }), on: v }; saveProject(); draw(); }),
-          h('p', { class: 'muted small', style: { marginLeft: '30px' } }, e.body?.on ? (prof?.body?.ok ? 'Your full-body photo follows this actor’s motion.' : 'Needs an analyzed full-body photo on the character.') : 'Keeping the actor’s body; only the parts checked below change.'),
-          check('Change outfit', outfitOn(e), v => { e.outfit = { on: v }; saveProject(); draw(); }),
-          h('p', { class: 'muted small', style: { marginLeft: '30px' } }, outfitOn(e) ? 'Pick a garment and/or recolor below.' : 'Keeping the original actor’s outfit exactly as filmed.')),
+          check('Replace face', e.face.on, v => all(x => (x.face.on = v))),
+          check('Change hair (use my hairstyle)', e.hair.on, v => { all(x => (x.hair.on = v)); draw(); }),
+          check('Replace whole body (Animate)', !!e.body?.on, v => { all(x => (x.body = { ...(x.body || { light: 0.6, opacity: 1 }), on: v })); draw(); }),
+          check('Change outfit', outfitOn(e), v => { all(x => (x.outfit = { on: v })); draw(); }),
+          h('p', { class: 'muted small' }, [e.hair.on ? 'new hair' : 'original hair', e.body?.on ? 'whole body replaced' : 'original body', outfitOn(e) ? 'outfit changes' : 'original outfit'].join(' · '))),
         e.hair.on && !prof?.hair ? callout(h('span', null, 'Hair is on, but this character has no hair layer yet. ', prof ? h('a', { href: `#/character/${prof.id}` }, 'Extract it in the Character Builder') : null), 'warn') : null,
-        outfitOn(e) ? h('div', { class: 'stack' }, h('div', { class: 'grid2' }, garmentSel('top'), garmentSel('bottom')), check('Recolor the actor’s clothes', e.recolor.on, v => { e.recolor.on = v; saveProject(); })) : null));
+        e.body?.on && prof && !prof.body?.ok ? callout(h('span', null, 'Whole body needs a full-body photo. ', h('a', { href: `#/character/${prof.id}` }, 'Add it')), 'warn') : null,
+        outfitOn(e) ? h('div', { class: 'stack' }, h('div', { class: 'grid2' }, garmentSel('top'), garmentSel('bottom')), check('Recolor the actor’s clothes', e.recolor.on, v => all(x => (x.recolor.on = v)))) : null));
     }
+    if (ppl.length > 1) rows.unshift(panel(h('h3', null, `Recasting ${ppl.length} people at once`),
+      h('p', { class: 'muted small' }, 'Each person gets their own character, settings, masks and timeline layer. They are rendered one after another per frame to keep memory low.'),
+      h('div', { class: 'row' }, h('button', { class: 'btn sm', onclick: () => {
+        const pool = S.profiles.filter(x => x.self || x.consent); let i = 0;
+        for (const g of ppl) { const pr = pool[i++]; if (!pr) break; for (const x of p.cast.filter(c => g.tracks.includes(c.trackId))) { x.profileId = pr.id; applyModeDefaults(x, p.mode, pr, { hair: x.hair.on, outfit: outfitOn(x), body: !!x.body?.on }); } }
+        saveProject(); draw(); toast(pool.length >= ppl.length ? `Cast ${ppl.length} people` : `Only ${pool.length} character(s) available: the rest keep the original actor`);
+      } }, 'Auto-assign my characters in order'))));
     if (!rows.length) rows.push(callout('No actors selected. Go back to Actor Detection and tap the people you want to recast.', 'warn'));
     wrap.replaceChildren(
       h('div', { class: 'row between' }, h('h2', null, 'Cast Director'), statusChip(MODES.find(m => m.key === p.mode)?.status || 'functional')),
@@ -1077,7 +1135,8 @@ async function exportScreen(p) {
             x.verify = v; saveProject(); showVerify(v);
           } catch (e) { verifyBox.replaceChildren(callout('Verification failed: ' + e.message, 'bad')); }
           ev.target.disabled = false;
-        } }, 'Verify export'))),
+        } }, 'Verify export'),
+        h('a', { class: 'btn', href: '#/edit' }, 'Use in a TikTok edit'))),
     verifyBox,
     panel(h('h3', null, 'Project file'), h('p', { class: 'muted small' }, 'The project (source copy, tracking, cast settings, keyframes) is saved on this device automatically. You can also export it as a file, which includes the source video.'),
       h('button', { class: 'btn sm', onclick: async () => {
@@ -1114,7 +1173,8 @@ async function library() {
   return [
     h('h1', null, 'Characters'),
     h('div', { class: 'row' },
-      h('a', { class: 'btn primary', href: '#/character/new' }, S.profiles.some(x => x.self) ? '+ New character' : '+ Create “Myself”'),
+      fileButton('✦ New character from one photo', 'image/*', f => quickCharacter(f), { cls: 'btn primary' }),
+      h('a', { class: 'btn', href: '#/character/new' }, S.profiles.some(x => x.self) ? '+ New character (manual)' : '+ Create “Myself” (manual)'),
       fileButton('Import profile', '.json,application/json', async f => {
         try {
           const d = JSON.parse(await f.text()); if (d.format !== 'recast-character') throw new Error('Not a RECAST character file');
@@ -1130,6 +1190,38 @@ async function library() {
     list,
     h('p', { class: 'muted small' }, 'Photos and analysis stay in this browser’s storage. Nothing is uploaded.'),
   ];
+}
+
+/** One photo → a complete character: face (full-res crop), hair layer, and, if the whole body is in the photo,
+ *  a rigged body and T-pose model. Each step reports honestly whether it ran. */
+async function quickCharacter(f) {
+  const ms = await modelStatus();
+  if (!ms.face) { toast('Install the Face Landmarker first (Models).', true); location.hash = '#/models'; return; }
+  const self = !S.profiles.some(x => x.self), pr = newProfile(self ? 'Myself' : 'New character', self);
+  const steps = [['face', 'Face texture and 3D face mesh'], ['hair', 'Hair layer'], ['body', 'Full body rig'], ['tpose', 'T-pose model']];
+  const rows = Object.fromEntries(steps.map(([k, l]) => [k, h('div', { class: 'row between' }, h('span', null, l), chip('waiting'))]));
+  const set = (k, txt, kind) => rows[k].lastChild.replaceWith(chip(txt, kind));
+  const box = h('div', { class: 'modal' }, h('div', { class: 'box' }, h('h2', null, 'Building your character'), h('p', { class: 'muted small' }, 'Everything is generated from this one photo, on this device.'), ...Object.values(rows)));
+  document.body.appendChild(box);
+  try {
+    pr.refs.front = { blob: f, name: f.name, at: Date.now() };
+    set('face', 'working…', 'v'); const a = await analyzeReference(f); pr.refs.front.analysis = a;
+    if (!a.ok) throw new Error('No face found in that photo. Use a photo where your face is clearly visible.');
+    set('face', a.quality.refined ? 'done · full-res crop' : 'done', a.quality.score > 70 ? 'ok' : 'warn');
+    if (ms.multiclass) { set('hair', 'working…', 'v'); try { pr.hair = await extractHair(f, a); set('hair', 'done', 'ok'); } catch (e) { set('hair', 'skipped: ' + e.message.slice(0, 40), 'warn'); } } else set('hair', 'needs Multiclass model', 'warn');
+    if (ms.selfie && (ms.pose_lite || ms.pose_full)) {
+      set('body', 'working…', 'v');
+      try {
+        const b = await analyzeBody(f, blobToCanvas);
+        if (b.missing.some(k => /An|Kn/.test(k))) throw new Error('legs not fully in the photo');
+        pr.refs.body = { blob: f, name: f.name, at: Date.now() }; pr.bodyPhoto = b; pr.body = b; set('body', 'done', 'ok');
+        set('tpose', 'working…', 'v'); pr.body = await makeTPoseModel(b, { toCanvas: blobToCanvas, Renderer: FaceRenderer }); set('tpose', 'done', 'ok');
+      } catch (e) { set('body', 'skipped: ' + e.message.slice(0, 44), 'warn'); set('tpose', 'needs a full-body photo', 'warn'); }
+    } else { set('body', 'needs Pose + Selfie models', 'warn'); set('tpose', 'needs Pose + Selfie models', 'warn'); }
+    await db.put('profiles', pr); await reloadLibrary();
+    await new Promise(r => setTimeout(r, 900));
+    box.remove(); toast(pr.self ? 'Character ready' : 'Character ready. Confirm consent before using it.'); location.hash = `#/character/${pr.id}`;
+  } catch (e) { box.remove(); toast(e.message, true, 7000); }
 }
 
 // ───────────────────────── 6. Character builder ─────────────────────────
@@ -1187,7 +1279,7 @@ async function characterBuilder(id) {
           check(`I confirm ${pr.name || 'this person'} has agreed to have their likeness used in RECAST edits, and I will share the results only as they agreed.`, !!pr.consent, async v => { pr.consent = v ? { by: 'user-confirmed', at: Date.now(), name: pr.name } : null; await save(); draw(); }),
           pr.consent ? h('p', { class: 'muted small mono' }, `Consent recorded ${new Date(pr.consent.at).toLocaleString()}`) : callout('Without consent this character cannot be used in renders.', 'bad')) : null),
       !ms.face ? callout(h('span', null, 'Install the Face Landmarker to analyze photos. ', h('a', { href: '#/models' }, 'Model Manager')), 'warn') : null,
-      miss.length ? callout(`Missing views that reduce quality: ${miss.join(', ')}. One selfie is enough for frontal shots only; turned heads need side photos.`, 'warn') : null,
+      miss.length ? callout(`Optional: ${miss.join(', ')}. With one photo, turned heads are rendered from your front photo using the 3D face mesh. Real side photos add detail the front photo cannot show (ears, the far cheek, profile shape).`) : null,
       needsAnalysis.length && ms.face ? h('button', { class: 'btn', onclick: async () => { for (const k of needsAnalysis) { try { pr.refs[k].analysis = await analyzeReference(pr.refs[k].blob); } catch (e) { toast(e.message, true); } } await save(); draw(); } }, `Analyze ${needsAnalysis.length} photo(s)`) : null,
       h('h2', null, 'Reference photos'),
       h('p', { class: 'muted small' }, 'Front face: look at the camera, even light, face filling at least a third of the photo, no glasses or hair over the eyes. Profiles: turn about 45° and 90°.'),
@@ -1361,7 +1453,7 @@ async function settingsScreen() {
       h('div', { class: 'row' }, h('button', { class: 'btn', onclick: async () => toast((await requestPersist()) ? 'Persistent storage granted' : 'Safari declined. Adding to Home Screen improves retention.') }, 'Request persistent storage'),
         h('button', { class: 'btn danger', onclick: async () => { if (!(await confirmBox('Delete all RECAST data?', 'Projects, characters, wardrobe, models and exports on this device will be erased.', 'Erase everything'))) return; disposeAll(); await db.wipe(); S.project = null; S.file = null; await reloadLibrary(); toast('All data erased'); location.hash = '#/'; } }, 'Delete all data'))),
     panel(h('h2', null, 'About & licenses'),
-      h('p', { class: 'small' }, 'RECAST AI+ v0.4 · private, local, static web app.'),
+      h('p', { class: 'small' }, 'RECAST AI+ v0.5 · private, local, static web app.'),
       h('ul', { class: 'small muted' },
         h('li', null, 'MediaPipe Tasks Vision (Google) — Apache-2.0. Pose, Face, Hand Landmarker and Image Segmenter models: Apache-2.0, see each model card.'),
         h('li', null, 'Mediabunny (Vanilagy) — MPL-2.0. MP4/MOV demuxing, decoding and encoding via WebCodecs.'),

@@ -177,14 +177,20 @@ export function faceDraw(rt, r, k, src) {
     x = (x - cx) * tr.scale; y = (y - cy) * tr.scale;
     P[i * 2] = cx + x * cs - y * sn + tr.x * fw; P[i * 2 + 1] = cy + x * sn + y * cs + tr.y * fw;
   }
-  const idx = [];
+  const idx = [], depth = [];
   r.mesh.tris.forEach(([a, b, c], t) => {
     const f = r.mesh.flags[t];
     if (e.face.keepMouth && f & 1) return; if (e.face.keepEyes && f & 2) return;
     if (best.key !== 'front' && triSign(ref, a, b, c) <= 0) return;
     if (triSign(P, a, b, c) <= 0) return;
-    idx.push(a, b, c);
+    idx.push(a, b, c); depth.push(L[a * 3 + 2] + L[b * 3 + 2] + L[c * 3 + 2]);
   });
+  // turned heads: draw far triangles first so the nose and near cheek correctly cover the far side
+  if (Math.abs(yaw) > 0.12) {
+    const order = depth.map((d, i) => i).sort((i, j) => depth[j] - depth[i]), sorted = new Array(idx.length);
+    order.forEach((ti, k) => { sorted[k * 3] = idx[ti * 3]; sorted[k * 3 + 1] = idx[ti * 3 + 1]; sorted[k * 3 + 2] = idx[ti * 3 + 2]; });
+    idx.splice(0, idx.length, ...sorted);
+  }
   if (idx.length < 30) return null;
   const alpha = new Float32Array(n); for (let i = 0; i < n; i++) alpha[i] = smoothstep(0, e.face.feather, best.edge[i]);
   // SceneBlend: low-frequency color + lighting transfer, per vertex

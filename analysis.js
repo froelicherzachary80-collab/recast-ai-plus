@@ -3,6 +3,7 @@ import { getTask, nextTs, hasModel } from './models.js';
 import { iterateFrames } from './media.js';
 import { Tracker, bboxFromLandmarks } from './tracker.js';
 import { N_FACE } from './facemesh.js';
+import { frameSignature, CutDetector, appearance } from './people.js';
 
 /** Runs pose (+face, +hands) on every planned frame. onProgress(done,total,frame). */
 export async function analyzeVideo(file, meta, plan, { signal, onProgress, hands = false, poseModel = 'pose_lite' } = {}) {
@@ -10,14 +11,17 @@ export async function analyzeVideo(file, meta, plan, { signal, onProgress, hands
   const pose = await getTask(poseKey, 'VIDEO', { num: 4 });
   const face = await getTask('face', 'VIDEO', { num: 4 });
   const hand = hands && (await hasModel('hand')) ? await getTask('hand', 'VIDEO') : null;
-  const tracker = new Tracker({ maxGap: Math.round(plan.fps * 1.5), maxTracks: 16 });
+  let tracker = new Tracker({ maxGap: Math.round(plan.fps * 1.5), maxTracks: 64 });
+  const cd = new CutDetector(plan.fps);
   const frames = new Array(plan.frames).fill(null);
   const t0 = performance.now(); let done = 0;
   for await (const { index, canvas } of iterateFrames(file, meta, plan, { signal })) {
     if (signal?.aborted) break;
+    // shot cuts: restart identity tracking so a new shot never continues someone else's track
+    if (cd.push(frameSignature(canvas), index).cut) { const next = tracker.nextId; tracker = new Tracker({ maxGap: Math.round(plan.fps * 1.5), maxTracks: 64 }); tracker.nextId = next; }
     const people = detectPeople(pose, face, canvas);
     tracker.update(index, people);
-    const kept = people.filter(p => p.trackId != null).map(p => ({ id: p.trackId, pose: p.pose, face: p.face, bbox: p.bbox, faceOnly: !!p.faceOnly }));
+    const kept = people.filter(p => p.trackId != null).map(p => ({ id: p.trackId, pose: p.pose, face: p.face, bbox: p.bbox, faceOnly: !!p.faceOnly, desc: appearance(canvas, plan.width, plan.height, p) }));
     const entry = { people: kept };
     if (hand) {
       const hr = hand.detectForVideo(canvas, nextTs());
@@ -28,7 +32,7 @@ export async function analyzeVideo(file, meta, plan, { signal, onProgress, hands
     if (done % 2 === 0) await new Promise(r => setTimeout(r, 0)); // let the UI breathe
   }
   for (let i = 0; i < frames.length; i++) if (!frames[i]) frames[i] = { people: [], missing: true };
-  return { frames, fps: plan.fps, poseModel: poseKey, hands: !!hand, completed: done, total: plan.frames, cancelled: !!signal?.aborted, at: Date.now() };
+  return { frames, cuts: cd.cuts, fps: plan.fps, poseModel: poseKey, hands: !!hand, completed: done, total: plan.frames, cancelled: !!signal?.aborted, at: Date.now() };
 }
 
 /** Detect people (pose + associated face) on one frame. Returns [{pose, face, bbox, faceOnly}] without ids. */

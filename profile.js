@@ -46,8 +46,8 @@ export function faceBox(xy, margin = 0.15) {
 }
 
 /** Analyze one reference photo. Returns serializable analysis. */
-export async function analyzeReference(blob) {
-  const canvas = await blobToCanvas(blob);
+export async function analyzeReference(blob, { refine = true } = {}) {
+  let canvas = await blobToCanvas(blob);
   const task = await getTask('face', 'IMAGE', { num: 2 });
   const r = task.detect(canvas);
   const faces = r.faceLandmarks || [];
@@ -57,6 +57,22 @@ export async function analyzeReference(blob) {
   // largest face
   let best = faces[0], bw = 0;
   for (const f of faces) { const xs = f.map(p => p.x); const w = Math.max(...xs) - Math.min(...xs); if (w > bw) { bw = w; best = f; } }
+  // One full-body or group photo: the face is small. Re-crop it from the full-resolution image and detect again,
+  // so the face texture keeps all the detail the photo has.
+  if (refine) {
+    const xs = best.map(p => p.x), ys = best.map(p => p.y), fwN = Math.max(...xs) - Math.min(...xs);
+    if (fwN * canvas.width < 420) {
+      const full = await blobToCanvas(blob, 6000);
+      if (full.width > canvas.width * 1.2) {
+        const cx = (Math.max(...xs) + Math.min(...xs)) / 2 * full.width, cy = (Math.max(...ys) + Math.min(...ys)) / 2 * full.height, side = Math.min(full.width, full.height, fwN * full.width * 2.6);
+        const x0 = Math.max(0, Math.min(full.width - side, cx - side / 2)), y0 = Math.max(0, Math.min(full.height - side, cy - side * 0.55));
+        const crop = document.createElement('canvas'), out = Math.min(1280, Math.round(side)); crop.width = crop.height = out;
+        const cctx0 = crop.getContext('2d'); cctx0.imageSmoothingQuality = 'high'; cctx0.drawImage(full, x0, y0, side, side, 0, 0, out, out);
+        const r2 = task.detect(crop);
+        if (r2.faceLandmarks?.length) { canvas = crop; best = r2.faceLandmarks.reduce((a, f) => (Math.max(...f.map(p => p.x)) - Math.min(...f.map(p => p.x)) > Math.max(...a.map(p => p.x)) - Math.min(...a.map(p => p.x)) ? f : a)); q.refined = true; q.width = canvas.width; q.height = canvas.height; }
+      }
+    }
+  }
   const xy = new Float32Array(N_FACE * 2), lm3 = new Float32Array(N_FACE * 3);
   for (let i = 0; i < N_FACE; i++) { const p = best[i] || best[best.length - 1]; xy[i * 2] = p.x * canvas.width; xy[i * 2 + 1] = p.y * canvas.height; lm3[i * 3] = p.x; lm3[i * 3 + 1] = p.y; lm3[i * 3 + 2] = p.z; }
   const box = faceBox(xy, 0.05);
@@ -114,7 +130,7 @@ export async function extractHair(blob, analysis) {
   if (count < 200) throw new Error('Almost no hair found in this photo.');
   // anchor landmarks for alignment — from this photo's own face landmarks
   let xy = analysis?.xy;
-  if (!xy || analysis.w !== canvas.width) { const a = await analyzeReference(blob); if (!a.ok) throw new Error('No face found in hair photo for alignment.'); xy = a.xy; }
+  if (!xy || analysis.w !== canvas.width || analysis.quality?.refined) { const a = await analyzeReference(blob, { refine: false }); if (!a.ok) throw new Error('No face found in hair photo for alignment.'); xy = a.xy; }
   const png = await new Promise(res => canvas.toBlob(res, 'image/png'));
   return { png, xy, w: canvas.width, h: canvas.height, pixels: count };
 }
