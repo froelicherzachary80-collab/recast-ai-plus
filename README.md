@@ -223,3 +223,10 @@ If something fails on device, the capability test and self-test output identify 
 - Mediabunny — MPL-2.0 © Vanilagy.
 - Archivo, IBM Plex Sans, IBM Plex Mono — SIL Open Font License 1.1.
 - RECAST AI+ source in this folder — yours to license.
+
+---
+
+## ZMF VOX STUDIO+ (new, in `vox/`)
+
+A separate on-device AI singing-cover studio (React + TypeScript + Vite PWA, ONNX Runtime Web)
+lives in [`vox/`](vox/README.md). It does not change the RECAST AI+ app above.
