@@ -1,4 +1,9 @@
 // RECAST AI+ — tiny DOM toolkit.
+// replaceChildren/append turn null into the text "null"; skip empty children everywhere.
+for (const name of ['replaceChildren', 'append']) {
+  const orig = Element.prototype[name];
+  Element.prototype[name] = function (...kids) { return orig.apply(this, kids.flat(Infinity).filter(k => k != null && k !== false)); };
+}
 export function h(tag, props, ...kids) {
   const el = document.createElement(tag);
   if (props) for (const [k, v] of Object.entries(props)) {

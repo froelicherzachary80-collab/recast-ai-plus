@@ -106,11 +106,11 @@ export function mirrorPose(P, cx) {
 }
 
 // ───────── dance presets (built from your own rest pose, so proportions are yours) ─────────
-const UP = -Math.PI / 2, DOWN = Math.PI / 2;
+export const UP = -Math.PI / 2, DOWN = Math.PI / 2;
 /** Arm angles are given as screen directions; 'outer' means away from the body on that side. */
-function sideSign(I, limb) { return I.R[limb === 'l' ? 'lSh' : 'rSh'][0] >= I.R.neck[0] ? 1 : -1; } // +1 = arm on screen-right
+export function sideSign(I, limb) { return I.R[limb === 'l' ? 'lSh' : 'rSh'][0] >= I.R.neck[0] ? 1 : -1; } // +1 = arm on screen-right
 /** Arm/leg direction from "elevation": 0 = hanging straight down, π/2 = straight out to that side, π = straight up. */
-const outDir = (sgn, elev) => DOWN - sgn * elev;
+export const outDir = (sgn, elev) => DOWN - sgn * elev;
 export const PRESETS = {
   wave: { name: 'Wave hello', duration: 2, make(I, base) {
     const sr = sideSign(I, 'r'), keys = [];

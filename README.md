@@ -5,6 +5,17 @@ A local, private actor-replacement studio that runs entirely in the browser. Imp
 No server, no account, no paid API. All media stays in the browser's IndexedDB on your device.
 
 
+## What's new in v0.4 — T-pose models, scenes and photos
+- **T-pose model maker.** In Characters (Full body photo → *Make T-pose model*) or Pose Studio (Model panel), your full-body photo is turned into a T-pose model sheet: arms straight out, bones kept at your lengths, over-stretched skin torn instead of smeared, and the torso skinned as a region so arms held close to the body don't drag the chest. The T-pose becomes your rig's bind pose, so raised-arm, superhero and dance poses bend far more cleanly. Best of all: add a real **T-pose photo** (stand in a T-pose), which is used directly.
+- **Pose library** (searchable): Basics (T-pose, A-pose, relaxed), Poster (hero stance, arms crossed, fist raised, victory, thinker, cool lean), Superhero (hero landing with IK-planted feet, take off, hover, energy blast, palm blast, ready to fight, thunder call), Dance and Everyday. Superhero poses come with matching effects.
+- **Two-person scenes** with up to 4 characters on stage: holding hands, heads together, arm around shoulder, slow dance (side by side), high five, back to back, face-off, energy clash. Contacts are solved with IK so hands really meet, and both stand on one floor. Only you and characters with recorded consent can be added.
+- **Duet learning:** learn two dancers from one video onto two characters.
+- **Photos:** *Put me into this photo* finds the biggest person in a background photo and places your model in their exact spot, size and pose; *Paint out the original person* removes them (soft fill). Full-body recast in photo projects also uses your T-pose model.
+- **Look & effects:** colour grades (blockbuster, noir, warm romance, night, comic, vintage), vignette, cinema bars, a ground shadow that fades when you jump or fly, and effects (hand glow, energy beam, lightning, shockwave, jet trail, aura).
+- **Poster text:** title, tagline, date line and credits block in poster fonts. Story, Poster 2:3, square and wide canvases; export PNG, JPEG or MP4.
+- Limits: still a 2D model from front-facing photos. Side/back views, face-to-face scenes (kissing, chest-to-chest dancing), hands and loose clothing are not generated. Use your own titles, not studio logos or film names you don't own.
+- Checked in headless Chromium with synthetic test characters: T-pose generation, library and duo poses, grading, poster text, dance playback, PNG export and phone layout ran with no errors. Not yet run on an iPhone.
+
 ## What's new in v0.3 — Pose Studio
 Your full-body photo becomes a posable model (tab **Pose**):
 - **Pose by dragging** joints. Elbows and knees swing a limb, wrists and ankles bend it with two-bone IK, the neck leans the torso (hips stay planted), the head dot turns the head, the green dot moves the whole body. Bone lengths always stay yours. Size, mirror, reset, and a saved-poses library.
@@ -177,7 +188,7 @@ Status below is what the code does. **It has not yet been run in Safari on an iP
 
 | Area | Status |
 |---|---|
-| Pure logic (Delaunay, similarity fit, affine/bilinear maps, keyframes, tracker identity through occlusion, swap/merge, gap filling, One Euro, mesh build, frame selection/timing, presets, garment grid) | **43 Node unit tests, all passing** (incl. WSOLA, voice detection, take fitting, body rig, hole filling) (`npm test`). |
+| Pure logic (Delaunay, similarity fit, affine/bilinear maps, keyframes, tracker identity through occlusion, swap/merge, gap filling, One Euro, mesh build, frame selection/timing, presets, garment grid) | **52 Node unit tests, all passing** (incl. WSOLA, voice detection, take fitting, body rig, hole filling) (`npm test`). |
 | All modules | Parse-checked with Node; all cross-module imports resolve. |
 | Browser pipeline (storage, encode, decode + pixel check, WebGL warp, model start-up) | Implemented as in-app **self-tests** (Settings). **Not yet executed** — the build environment had no browser and no access to the CDN or model hosts. |
 | End-to-end on iPhone 16 Pro Safari | **Not yet executed.** Use the walkthrough in §4. The v0.1 acceptance criteria should be treated as unverified until that run passes. |

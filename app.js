@@ -1,4 +1,4 @@
-// RECAST AI+ v0.3 — application shell and screens.
+// RECAST AI+ v0.4 — application shell and screens.
 import { h, $, toast, confirmBox, slider, check, seg, chip, progressBar, fileButton, timecode, downloadBlob, shareFile, icon } from './ui.js';
 import { db, uid, storageInfo, requestPersist } from './db.js';
 import { MODELS, UNAVAILABLE_MODELS, modelStatus, downloadModel, importModel, deleteModel, hasModel, getTask, runtime as mpRuntime, loadVision, disposeAll } from './models.js';
@@ -13,6 +13,8 @@ import { renderProject } from './render.js';
 import { analyzeBody, buildCleanPlate } from './plate.js';
 import * as Dub from './dub.js';
 import { poseStudio } from './posestudio.js';
+import { makeTPoseModel } from './tpose.js';
+import { FaceRenderer } from './facerender.js';
 import { capabilityTest, fmtBytes } from './caps.js';
 import { runSelfTests } from './selftest.js';
 
@@ -170,7 +172,7 @@ async function dashboard() {
         } }, 'Delete'))));
   }
   return [
-    h('div', { class: 'hero-slate' }, h('span', { class: 'eyebrow' }, 'Private · on-device · v0.3'), h('h1', null, 'Put yourself in the scene, or on the poster.')),
+    h('div', { class: 'hero-slate' }, h('span', { class: 'eyebrow' }, 'Private · on-device · v0.4'), h('h1', null, 'Put yourself in the scene, or on the poster.')),
     h('a', { class: 'create', href: '#/new' }, h('span', { class: 'plus' }, '+ CREATE NEW RECAST'), h('span', { class: 'muted small' }, 'Video scene or photo poster → actor → your photos → export')),
     missing.length ? callout(h('span', null, 'Install the required models first: ', missing.map(m => m.name).join(', '), '. ', h('a', { href: '#/models' }, 'Open Model Manager')), 'warn') : null,
     panel(h('div', { class: 'row between' }, h('h2', null, 'Projects'), h('div', { class: 'row' }, fileButton('Import project', '.json,application/json', importProjectFile, { cls: 'btn sm ghost' }), h('a', { class: 'btn sm ghost', href: '#/queue' }, 'Render queue'))), list),
@@ -1120,6 +1122,7 @@ async function library() {
           for (const [k, r] of Object.entries(d.images || {})) { pr.refs[k] = pr.refs[k] || {}; pr.refs[k].blob = await b64ToBlob(r.b64, r.type); if (pr.refs[k].analysis) { if (r.tex) pr.refs[k].analysis.texBlob = await b64ToBlob(r.tex, 'image/jpeg'); else pr.refs[k].analysis = null; } }
           if (d.hair) pr.hair.png = await b64ToBlob(d.hair, 'image/png');
           if (d.body && pr.body) pr.body.png = await b64ToBlob(d.body, 'image/png'); else if (pr.body) pr.body = null;
+          if (d.bodyPhoto && pr.bodyPhoto) pr.bodyPhoto.png = await b64ToBlob(d.bodyPhoto, 'image/png'); else if (pr.bodyPhoto) pr.bodyPhoto = null;
           if (!pr.self && !pr.consent) toast('Imported without consent: confirm consent before use.', true);
           await db.put('profiles', pr); toast(`Imported ${pr.name}`); route();
         } catch (e) { toast('Import failed: ' + e.message, true); }
@@ -1154,11 +1157,15 @@ async function characterBuilder(id) {
           fileButton(r ? 'Replace' : 'Add photo', 'image/*', async f => {
             pr.refs[s.key] = { blob: f, name: f.name, at: Date.now() };
             if (isFace && ms.face && s.key !== 'hair') { try { toast('Analyzing face…'); pr.refs[s.key].analysis = await analyzeReference(f); } catch (e) { toast('Analysis failed: ' + e.message, true); } }
-            if (s.key === 'body') { try { toast('Rigging your body…'); pr.body = await analyzeBody(f, blobToCanvas); } catch (e) { pr.body = null; toast('Body analysis failed: ' + e.message, true, 7000); } }
+            if (s.key === 'body') { try { toast('Rigging your body…'); pr.bodyPhoto = await analyzeBody(f, blobToCanvas); if (!pr.body?.source?.startsWith('tpose')) pr.body = pr.bodyPhoto; } catch (e) { toast('Body analysis failed: ' + e.message, true, 7000); } }
+            if (s.key === 'tpose') { try { toast('Rigging your T-pose…'); pr.body = { ...(await analyzeBody(f, blobToCanvas)), source: 'tpose-photo', at: Date.now() }; } catch (e) { toast('T-pose analysis failed: ' + e.message, true, 7000); } }
             await save(); draw();
           }, { cls: 'btn sm' }),
-          r ? h('button', { class: 'btn sm ghost danger', onclick: async () => { delete pr.refs[s.key]; if (s.key === 'body') pr.body = null; await save(); draw(); } }, 'Delete') : null),
-          s.key === 'body' && r ? (pr.body?.ok ? h('div', { class: 'stack', style: { gap: '4px' } }, h('div', { class: 'row' }, chip('rigged', 'ok'), h('a', { class: 'btn sm', href: `#/pose/${pr.id}` }, 'Pose Studio')), pr.body.issues?.length ? h('p', { class: 'small', style: { color: 'var(--warn)' } }, pr.body.issues.join(' ')) : null)
+          r ? h('button', { class: 'btn sm ghost danger', onclick: async () => { delete pr.refs[s.key]; if (s.key === 'body') { pr.bodyPhoto = null; if (!pr.body?.source?.startsWith('tpose')) pr.body = null; } if (s.key === 'tpose' && pr.body?.source === 'tpose-photo') pr.body = pr.bodyPhoto || null; await save(); draw(); } }, 'Delete') : null),
+          s.key === 'tpose' && pr.body?.source === 'tpose-photo' ? h('div', { class: 'row' }, chip('active model', 'ok'), h('a', { class: 'btn sm', href: `#/pose/${pr.id}` }, 'Pose Studio')) : null,
+          s.key === 'body' && r ? ((pr.bodyPhoto || pr.body)?.ok ? h('div', { class: 'stack', style: { gap: '4px' } }, h('div', { class: 'row' }, chip(pr.body?.source === 'tpose-generated' ? 'T-pose model made' : 'rigged', 'ok'),
+              h('button', { class: 'btn sm', onclick: async ev => { ev.target.disabled = true; try { const src = pr.bodyPhoto || pr.body; pr.bodyPhoto = src; pr.body = await makeTPoseModel(src, { toCanvas: blobToCanvas, Renderer: FaceRenderer }); await save(); toast('T-pose model ready'); draw(); } catch (e) { toast('T-pose failed: ' + e.message, true); ev.target.disabled = false; } } }, pr.body?.source === 'tpose-generated' ? 'Remake T-pose' : 'Make T-pose model'),
+              h('a', { class: 'btn sm', href: `#/pose/${pr.id}` }, 'Pose Studio')), pr.body.issues?.length ? h('p', { class: 'small', style: { color: 'var(--warn)' } }, pr.body.issues.join(' ')) : null)
             : h('button', { class: 'btn sm', onclick: async () => { try { pr.body = await analyzeBody(r.blob, blobToCanvas); await save(); draw(); } catch (e) { toast(e.message, true, 7000); } } }, 'Rig body')) : null);
     }));
     const needsAnalysis = ['front', 'left', 'right'].filter(k => pr.refs[k] && !pr.refs[k].analysis);
@@ -1210,8 +1217,8 @@ async function characterBuilder(id) {
         h('button', { class: 'btn', onclick: async () => {
           const images = {};
           for (const [k, r] of Object.entries(pr.refs)) if (r.blob) images[k] = { type: r.blob.type, b64: await blobToB64(r.blob), tex: r.analysis?.texBlob ? await blobToB64(r.analysis.texBlob) : null };
-          const clean = JSON.parse(JSON.stringify(serializeProject({ ...pr, refs: Object.fromEntries(Object.entries(pr.refs).map(([k, r]) => [k, { ...r, blob: null, analysis: r.analysis ? { ...r.analysis, texBlob: null } : null }])), hair: pr.hair ? { ...pr.hair, png: null } : null, body: pr.body ? { ...pr.body, png: null } : null, videos: {} })));
-          const data = { format: 'recast-character', version: 1, profile: clean, images, hair: pr.hair?.png ? await blobToB64(pr.hair.png) : null, body: pr.body?.png ? await blobToB64(pr.body.png) : null };
+          const clean = JSON.parse(JSON.stringify(serializeProject({ ...pr, refs: Object.fromEntries(Object.entries(pr.refs).map(([k, r]) => [k, { ...r, blob: null, analysis: r.analysis ? { ...r.analysis, texBlob: null } : null }])), hair: pr.hair ? { ...pr.hair, png: null } : null, body: pr.body ? { ...pr.body, png: null } : null, bodyPhoto: pr.bodyPhoto ? { ...pr.bodyPhoto, png: null } : null, videos: {} })));
+          const data = { format: 'recast-character', version: 1, profile: clean, images, hair: pr.hair?.png ? await blobToB64(pr.hair.png) : null, body: pr.body?.png ? await blobToB64(pr.body.png) : null, bodyPhoto: pr.bodyPhoto?.png ? await blobToB64(pr.bodyPhoto.png) : null };
           downloadBlob(new Blob([JSON.stringify(data)], { type: 'application/json' }), `${pr.name.replace(/[^\w-]+/g, '_')}.recastchar.json`);
         } }, 'Export profile'),
         h('button', { class: 'btn ghost danger', onclick: async () => { if (!(await confirmBox(`Delete ${pr.name}?`, 'All photos, videos and analysis for this character are removed from this device.'))) return; await db.del('profiles', pr.id); await reloadLibrary(); dropRuntime(); location.hash = '#/library'; } }, 'Delete character')));
@@ -1354,7 +1361,7 @@ async function settingsScreen() {
       h('div', { class: 'row' }, h('button', { class: 'btn', onclick: async () => toast((await requestPersist()) ? 'Persistent storage granted' : 'Safari declined. Adding to Home Screen improves retention.') }, 'Request persistent storage'),
         h('button', { class: 'btn danger', onclick: async () => { if (!(await confirmBox('Delete all RECAST data?', 'Projects, characters, wardrobe, models and exports on this device will be erased.', 'Erase everything'))) return; disposeAll(); await db.wipe(); S.project = null; S.file = null; await reloadLibrary(); toast('All data erased'); location.hash = '#/'; } }, 'Delete all data'))),
     panel(h('h2', null, 'About & licenses'),
-      h('p', { class: 'small' }, 'RECAST AI+ v0.3 · private, local, static web app.'),
+      h('p', { class: 'small' }, 'RECAST AI+ v0.4 · private, local, static web app.'),
       h('ul', { class: 'small muted' },
         h('li', null, 'MediaPipe Tasks Vision (Google) — Apache-2.0. Pose, Face, Hand Landmarker and Image Segmenter models: Apache-2.0, see each model card.'),
         h('li', null, 'Mediabunny (Vanilagy) — MPL-2.0. MP4/MOV demuxing, decoding and encoding via WebCodecs.'),

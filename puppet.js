@@ -47,12 +47,17 @@ export function buildRig(alpha, w, h, restJoints, { cells = 44, power = 5 } = {}
   }
   const n = pos.length / 2, rest = Float32Array.from(pos);
   const bones = BONES.map(([name, a0, b0]) => ({ name, a: restJoints[a0], b: restJoints[b0] }));
+  // The torso is a region, not a line: pixels inside the shoulder–hip quad belong to the torso, so arms
+  // held close to the body do not drag the sides of the chest with them.
+  const poly = ['lSh', 'rSh', 'rHip', 'lHip'].map(k => restJoints[k]).filter(Boolean);
+  const inPoly = (x, y) => { let c = false; for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) { const [xi, yi] = poly[i], [xj, yj] = poly[j]; if ((yi > y) !== (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi + 1e-12) + xi) c = !c; } return c; };
+  const polyDist = (x, y) => { if (poly.length < 4) return Infinity; if (inPoly(x, y)) return 0; let m = Infinity; for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) m = Math.min(m, distSeg(x, y, poly[j], poly[i])); return m; };
   // skin weights: top-2 nearest bones, inverse-distance^power
   const wIdx = new Uint8Array(n * 2), wVal = new Float32Array(n * 2);
   for (let v = 0; v < n; v++) {
     const x = rest[v * 2], y = rest[v * 2 + 1];
     let b1 = 0, d1 = Infinity, b2 = 0, d2 = Infinity;
-    bones.forEach((b, k) => { const d = distSeg(x, y, b.a, b.b); if (d < d1) { b2 = b1; d2 = d1; b1 = k; d1 = d; } else if (d < d2) { b2 = k; d2 = d; } });
+    bones.forEach((b, k) => { const d = b.name === 'torso' ? Math.min(distSeg(x, y, b.a, b.b), polyDist(x, y)) : distSeg(x, y, b.a, b.b); if (d < d1) { b2 = b1; d2 = d1; b1 = k; d1 = d; } else if (d < d2) { b2 = k; d2 = d; } });
     const e = step * 0.5, w1 = 1 / Math.pow(d1 + e, power), w2 = 1 / Math.pow(d2 + e, power), s = w1 + w2;
     wIdx[v * 2] = b1; wIdx[v * 2 + 1] = b2; wVal[v * 2] = w1 / s; wVal[v * 2 + 1] = w2 / s;
   }

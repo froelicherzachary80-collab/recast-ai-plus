@@ -8,6 +8,7 @@ export const SLOTS = [
   { key: 'left', label: 'Left profile', need: 'recommended', used: 'Face texture when the actor turns' },
   { key: 'right', label: 'Right profile', need: 'recommended', used: 'Face texture when the actor turns' },
   { key: 'hair', label: 'Hairstyle reference', need: 'optional', used: 'Hair overlay (front face photo is used if empty)' },
+  { key: 'tpose', label: 'T-pose photo', need: 'optional', used: 'Best Pose Studio model: arms straight out to the sides, facing the camera, head to feet, plain background.' },
   { key: 'body', label: 'Full body', need: 'recommended', used: 'Whole-body Animate: stand facing the camera, head to feet in frame, arms slightly away from the body, plain background.' },
   { key: 'side', label: 'Side body', need: 'optional', used: 'Stored for V0.2. Not used by v0.1 rendering.' },
   { key: 'rear', label: 'Rear body', need: 'optional', used: 'Stored for V0.2. Not used by v0.1 rendering.' },
